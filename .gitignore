@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+codex_backups/
+import_api*/
+outputs/
+datasets/
+LoCoMo_refined/
+
+model/all-mpnet-base-v2/
+model/spacy/
+
+*.parquet
+*.graphml
+ner_results.json
+metadata.json
