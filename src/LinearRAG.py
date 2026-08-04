@@ -32,6 +32,11 @@ class LinearRAG:
         self.llm_model = self.config.llm_model
         self.spacy_ner = getattr(self.config, "spacy_ner", None) or SpacyNER(self.config.spacy_model)
         self.graph = ig.Graph(directed=False)
+        self.structured_node_texts = {}
+        self.structured_node_types = {}
+        self.structured_node_status = {}
+        self.structured_node_ids = []
+        self.structured_node_embeddings = None
 
     def load_embedding_store(self):
         self.passage_embedding_store = EmbeddingStore(self.config.embedding_model, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "passage_embedding.parquet"), batch_size=self.config.batch_size, namespace="passage")
@@ -109,8 +114,18 @@ class LinearRAG:
             question = question_info["question"]
             question_embedding = self.config.embedding_model.encode(question,normalize_embeddings=True,show_progress_bar=False,batch_size=self.config.batch_size)
             seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores = self.get_seed_entities(question)
-            if len(seed_entities) != 0:
-                sorted_passage_hash_ids,sorted_passage_scores = self.graph_search_with_seed_entities(question,question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
+            structured_node_weights = self.calculate_structured_node_scores(question, question_embedding)
+            has_structured_seeds = bool(np.any(structured_node_weights > 0))
+            if len(seed_entities) != 0 or has_structured_seeds:
+                sorted_passage_hash_ids,sorted_passage_scores = self.graph_search_multi_entry(
+                    question,
+                    question_embedding,
+                    seed_entity_indices,
+                    seed_entities,
+                    seed_entity_hash_ids,
+                    seed_entity_scores,
+                    structured_node_weights,
+                )
                 final_passage_hash_ids = sorted_passage_hash_ids[:self.config.retrieval_top_k]
                 final_passage_scores = sorted_passage_scores[:self.config.retrieval_top_k]
                 final_passages = [self.passage_embedding_store.hash_id_to_text[passage_hash_id] for passage_hash_id in final_passage_hash_ids]
@@ -190,6 +205,33 @@ class LinearRAG:
             entity_weights, actived_entities = self.calculate_entity_scores(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
         passage_weights = self.calculate_passage_scores(question, question_embedding, actived_entities)
         node_weights = entity_weights + passage_weights
+        ppr_sorted_passage_indices,ppr_sorted_passage_scores = self.run_ppr(node_weights)
+        return ppr_sorted_passage_indices,ppr_sorted_passage_scores
+
+    def graph_search_multi_entry(
+        self,
+        question,
+        question_embedding,
+        seed_entity_indices,
+        seed_entities,
+        seed_entity_hash_ids,
+        seed_entity_scores,
+        structured_node_weights,
+    ):
+        if len(seed_entities) != 0:
+            if self.config.use_vectorized_retrieval:
+                entity_weights, actived_entities = self.calculate_entity_scores_vectorized(
+                    question_embedding, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores
+                )
+            else:
+                entity_weights, actived_entities = self.calculate_entity_scores(
+                    question_embedding, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores
+                )
+        else:
+            entity_weights = np.zeros(len(self.graph.vs["name"]))
+            actived_entities = {}
+        passage_weights = self.calculate_passage_scores(question, question_embedding, actived_entities)
+        node_weights = entity_weights + passage_weights + structured_node_weights
         ppr_sorted_passage_indices,ppr_sorted_passage_scores = self.run_ppr(node_weights)
         return ppr_sorted_passage_indices,ppr_sorted_passage_scores
 
@@ -552,6 +594,142 @@ class LinearRAG:
             seed_entity_scores.append(best_entity_score)
         return seed_entity_indices, seed_entity_texts, seed_entity_hash_ids, seed_entity_scores
 
+    def calculate_structured_node_scores(self, question, question_embedding):
+        weights = np.zeros(len(self.graph.vs["name"]))
+        if not getattr(self.config, "enable_structured_memory_graph", False):
+            return weights
+        if not self.structured_node_ids:
+            return weights
+        self._prepare_structured_node_embeddings()
+        if self.structured_node_embeddings is None or len(self.structured_node_embeddings) == 0:
+            return weights
+
+        question_emb = question_embedding.reshape(1, -1)
+        similarities = np.dot(self.structured_node_embeddings, question_emb.T).flatten()
+        similarities = self._apply_structured_lexical_boost(question, similarities)
+        if len(similarities) == 0:
+            return weights
+
+        top_k = min(max(int(getattr(self.config, "structured_node_top_k", 24)), 0), len(self.structured_node_ids))
+        if top_k == 0:
+            return weights
+        sorted_indices = np.argsort(similarities)[::-1][:top_k]
+        threshold = float(getattr(self.config, "structured_score_threshold", 0.2))
+        base_weight = float(getattr(self.config, "structured_node_weight", 0.35))
+        intent = self._structured_query_intent(question)
+
+        top_scores = similarities[sorted_indices]
+        normalized_scores = min_max_normalize(top_scores.tolist()) if len(top_scores) > 1 else [1.0]
+        for local_rank, node_idx in enumerate(sorted_indices):
+            score = float(similarities[node_idx])
+            if score < threshold and local_rank > 2:
+                continue
+            node_id = self.structured_node_ids[node_idx]
+            vertex_idx = self.node_name_to_vertex_idx.get(node_id)
+            if vertex_idx is None:
+                continue
+            node_type = self.structured_node_types.get(node_id, "")
+            type_weight = self._structured_type_weight(node_type)
+            status_weight = self._structured_status_weight(node_id, intent)
+            weights[vertex_idx] = max(
+                weights[vertex_idx],
+                base_weight * type_weight * status_weight * max(float(normalized_scores[local_rank]), 0.05),
+            )
+        return weights
+
+    def _prepare_structured_node_embeddings(self):
+        if self.structured_node_embeddings is not None:
+            return
+        texts = [self.structured_node_texts[node_id] for node_id in self.structured_node_ids]
+        if not texts:
+            self.structured_node_embeddings = np.array([])
+            return
+        self.structured_node_embeddings = np.array(
+            self.config.embedding_model.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=self.config.batch_size,
+            )
+        )
+
+    def _apply_structured_lexical_boost(self, question, similarities):
+        boosted = similarities.astype(float).copy()
+        question_tokens = set(re.findall(r"\w+", question.lower()))
+        time_values = self._query_time_values(question)
+        for idx, node_id in enumerate(self.structured_node_ids):
+            content = self.structured_node_texts.get(node_id, "").lower()
+            node_type = self.structured_node_types.get(node_id, "")
+            overlap = sum(1 for token in question_tokens if len(token) > 2 and token in content)
+            if overlap:
+                boosted[idx] += min(0.2, 0.04 * overlap)
+            if node_type == "time" and any(value and value in content for value in time_values):
+                boosted[idx] += 0.35
+            if node_type == "event" and self._is_temporal_question(question):
+                boosted[idx] += 0.05
+            if node_type == "memory" and self._is_memory_status_question(question):
+                boosted[idx] += 0.05
+        return boosted
+
+    @staticmethod
+    def _query_time_values(question):
+        patterns = [
+            r"\b\d{4}-\d{1,2}-\d{1,2}\b",
+            r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
+            r"\b(?:19|20)\d{2}\b",
+            r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?\b",
+            r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
+            r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            r"\b(?:today|yesterday|tomorrow|tonight|last week|next week|last month|next month|last year|next year|recently|currently|now|before|previously)\b",
+        ]
+        values = []
+        for pattern in patterns:
+            for match in re.findall(pattern, question, flags=re.IGNORECASE):
+                value = str(match).strip().lower()
+                if value and value not in values:
+                    values.append(value)
+        return values
+
+    @staticmethod
+    def _structured_query_intent(question):
+        lowered = question.lower()
+        if any(token in lowered for token in ("current", "currently", "now", "latest", "recent", "recently")):
+            return "current"
+        if any(token in lowered for token in ("used to", "before", "previously", "earlier", "past", "old")):
+            return "history"
+        return "neutral"
+
+    @staticmethod
+    def _is_temporal_question(question):
+        lowered = question.lower()
+        return any(token in lowered for token in ("when", "date", "day", "month", "year", "time", "how long", "before", "after", "between"))
+
+    @staticmethod
+    def _is_memory_status_question(question):
+        lowered = question.lower()
+        return any(token in lowered for token in ("current", "currently", "now", "used to", "before", "previously", "prefer", "like", "relation", "who"))
+
+    def _structured_type_weight(self, node_type):
+        if node_type == "event":
+            return float(getattr(self.config, "structured_event_weight", 1.0))
+        if node_type == "memory":
+            return float(getattr(self.config, "structured_memory_weight", 0.9))
+        if node_type == "time":
+            return float(getattr(self.config, "structured_time_weight", 0.8))
+        return 1.0
+
+    def _structured_status_weight(self, node_id, intent):
+        status = self.structured_node_status.get(node_id, "")
+        if not status:
+            return 1.0
+        if status == "active":
+            return 1.1 if intent != "history" else 0.95
+        if status == "expired":
+            return 1.05 if intent == "history" else 0.65
+        if status == "conflicting":
+            return 0.75
+        return 1.0
+
     def index(self, passages):
         self.node_to_node_stats = defaultdict(dict)
         self.entity_to_sentence_stats = defaultdict(dict)
@@ -576,6 +754,7 @@ class LinearRAG:
             self.sentence_hash_id_to_entity_hash_ids[sentence_hash_id] = [self.entity_embedding_store.text_to_hash_id[e] for e in entities]
         self.add_entity_to_passage_edges(passage_hash_id_to_entities)
         self.add_adjacent_passage_edges()
+        self.add_structured_memory_graph(hash_id_to_passage)
         self.augment_graph()
         output_graphml_path = os.path.join(self.config.working_dir,self.dataset_name, "LinearRAG.graphml")
         os.makedirs(os.path.dirname(output_graphml_path), exist_ok=True)   
@@ -595,6 +774,209 @@ class LinearRAG:
             next_node = indexed_items[i + 1][1]
             self.node_to_node_stats[current_node][next_node] = 1.0
 
+    def add_structured_memory_graph(self, hash_id_to_passage):
+        self.structured_node_texts = {}
+        self.structured_node_types = {}
+        self.structured_node_status = {}
+        self.structured_node_ids = []
+        self.structured_node_embeddings = None
+        if not getattr(self.config, "enable_structured_memory_graph", False):
+            return
+
+        user_dir = os.path.join(self.config.working_dir, self.dataset_name)
+        raw_to_passages = self._raw_id_to_passage_hash_ids(hash_id_to_passage)
+        events = self._load_json_list(os.path.join(user_dir, "event_nodes.json"))
+        times = self._load_json_list(os.path.join(user_dir, "time_nodes.json"))
+        memories = self._load_json_list(os.path.join(user_dir, "consolidated_memories.json"))
+        graph_edges = self._load_jsonl(os.path.join(user_dir, "memory_graph_edges.jsonl"))
+
+        valid_time_ids = set()
+        for time_node in times:
+            time_id = str(time_node.get("time_id") or "")
+            if not time_id or self._is_message_timestamp_time(time_node):
+                continue
+            valid_time_ids.add(time_id)
+            self._add_structured_node(time_id, "time", self._time_node_text(time_node))
+
+        for event in events:
+            event_id = str(event.get("event_id") or "")
+            if not event_id:
+                continue
+            self._add_structured_node(event_id, "event", self._event_node_text(event))
+            raw_id = str(event.get("raw_id") or "")
+            for passage_id in raw_to_passages.get(raw_id, []):
+                self._add_weighted_edge(event_id, passage_id, 1.0)
+            self._connect_structured_node_to_entities(
+                event_id,
+                [event.get("subject"), event.get("object"), *(event.get("participants") or [])],
+                0.45,
+            )
+
+        for memory in memories:
+            memory_id = str(memory.get("memory_id") or "")
+            if not memory_id:
+                continue
+            status = str(memory.get("status") or "active")
+            self._add_structured_node(memory_id, "memory", self._memory_node_text(memory))
+            self.structured_node_status[memory_id] = status
+            evidence_weight = self._memory_evidence_weight(status)
+            for raw_id in memory.get("evidence_raw_ids") or []:
+                for passage_id in raw_to_passages.get(str(raw_id), []):
+                    self._add_weighted_edge(memory_id, passage_id, evidence_weight)
+            event_id = str(memory.get("event_id") or "")
+            if event_id:
+                self._add_weighted_edge(memory_id, event_id, 0.75)
+            for time_id in memory.get("time_node_ids") or []:
+                time_id = str(time_id)
+                if time_id in valid_time_ids:
+                    self._add_weighted_edge(memory_id, time_id, 0.65)
+            self._connect_structured_node_to_entities(
+                memory_id,
+                [memory.get("subject"), memory.get("object")],
+                0.35,
+            )
+            for old_id in memory.get("supersedes") or []:
+                self._add_weighted_edge(memory_id, str(old_id), 0.18)
+            if memory.get("superseded_by"):
+                self._add_weighted_edge(memory_id, str(memory.get("superseded_by")), 0.18)
+            for conflict_id in memory.get("conflicts_with") or []:
+                self._add_weighted_edge(memory_id, str(conflict_id), 0.12)
+
+        for edge in graph_edges:
+            source_id = str(edge.get("source_id") or "")
+            target_id = str(edge.get("target_id") or "")
+            edge_type = str(edge.get("edge_type") or "")
+            if not source_id or not target_id:
+                continue
+            if edge_type == "evidence":
+                for passage_id in raw_to_passages.get(target_id, []):
+                    self._add_weighted_edge(source_id, passage_id, 1.0)
+            elif edge_type == "occurs_at" and target_id in valid_time_ids:
+                self._add_weighted_edge(source_id, target_id, 0.85)
+
+        self.structured_node_ids = list(self.structured_node_texts.keys())
+
+    def _add_structured_node(self, node_id, node_type, text):
+        if not node_id or not text:
+            return
+        self.structured_node_texts[node_id] = text
+        self.structured_node_types[node_id] = node_type
+
+    def _add_weighted_edge(self, source_id, target_id, weight):
+        if not source_id or not target_id or source_id == target_id:
+            return
+        current = self.node_to_node_stats[source_id].get(target_id, 0.0)
+        self.node_to_node_stats[source_id][target_id] = max(float(current), float(weight))
+
+    @staticmethod
+    def _load_json_list(path):
+        if not os.path.exists(path):
+            return []
+        try:
+            data = json.load(open(path, encoding="utf-8"))
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    @staticmethod
+    def _load_jsonl(path):
+        if not os.path.exists(path):
+            return []
+        records = []
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+        return records
+
+    @staticmethod
+    def _raw_id_to_passage_hash_ids(hash_id_to_passage):
+        raw_to_passages = defaultdict(list)
+        for passage_hash_id, passage in hash_id_to_passage.items():
+            match = re.search(r"\[raw_id=([^\]]+)\]", passage)
+            if match:
+                raw_to_passages[match.group(1)].append(passage_hash_id)
+        return raw_to_passages
+
+    @staticmethod
+    def _is_message_timestamp_time(time_node):
+        expression = str(time_node.get("expression") or "")
+        source = str(time_node.get("source") or "")
+        kind = str(time_node.get("kind") or "")
+        return expression.startswith("message_timestamp:") or source == "message_timestamp" or kind == "message_timestamp"
+
+    @staticmethod
+    def _event_node_text(event):
+        subject = str(event.get("subject") or "").strip()
+        predicate = str(event.get("canonical_trigger") or event.get("event_trigger") or "").strip()
+        obj = str(event.get("object") or "").strip()
+        source = str(event.get("source_text") or "").strip()
+        parts = ["event"]
+        if subject or predicate or obj:
+            parts.append(f"{subject} {predicate} {obj}".strip())
+        if source:
+            parts.append(f"source: {source}")
+        return ". ".join(part for part in parts if part)
+
+    @staticmethod
+    def _memory_node_text(memory):
+        memory_type = str(memory.get("memory_type") or "").strip()
+        status = str(memory.get("status") or "").strip()
+        subject = str(memory.get("subject") or "").strip()
+        predicate = str(memory.get("predicate") or "").strip()
+        obj = str(memory.get("object") or "").strip()
+        source = str(memory.get("source_text") or "").strip()
+        parts = [f"memory {memory_type} {status}".strip()]
+        if subject or predicate or obj:
+            parts.append(f"{subject} {predicate} {obj}".strip())
+        if source:
+            parts.append(f"source: {source}")
+        return ". ".join(part for part in parts if part)
+
+    @staticmethod
+    def _time_node_text(time_node):
+        expression = str(time_node.get("expression") or "").strip()
+        normalized = str(time_node.get("normalized") or "").strip()
+        kind = str(time_node.get("kind") or "").strip()
+        if normalized and normalized != expression:
+            return f"time {normalized}. expression: {expression}. granularity: {kind}"
+        return f"time {expression}. granularity: {kind}"
+
+    @staticmethod
+    def _memory_evidence_weight(status):
+        if status == "active":
+            return 1.0
+        if status == "expired":
+            return 0.35
+        if status == "conflicting":
+            return 0.55
+        return 0.75
+
+    def _connect_structured_node_to_entities(self, node_id, values, weight):
+        entity_text_to_hash = {
+            self._normalize_for_match(text): hash_id
+            for hash_id, text in self.entity_embedding_store.hash_id_to_text.items()
+        }
+        for value in values:
+            norm = self._normalize_for_match(value)
+            if not norm or norm == "user":
+                continue
+            entity_hash_id = entity_text_to_hash.get(norm)
+            if entity_hash_id:
+                self._add_weighted_edge(node_id, entity_hash_id, weight)
+
+    @staticmethod
+    def _normalize_for_match(value):
+        text = str(value or "").lower().strip()
+        text = re.sub(r"^(?:a|an|the)\s+", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip(" \t\r\n\"'`.,!?")
+
     def augment_graph(self):
         self.add_nodes()
         self.add_edges()
@@ -603,13 +985,17 @@ class LinearRAG:
         existing_nodes = {v["name"]: v for v in self.graph.vs if "name" in v.attributes()} 
         entity_hash_id_to_text = self.entity_embedding_store.get_hash_id_to_text()
         passage_hash_id_to_text = self.passage_embedding_store.get_hash_id_to_text()
-        all_hash_id_to_text = {**entity_hash_id_to_text, **passage_hash_id_to_text}
+        all_hash_id_to_text = {**entity_hash_id_to_text, **passage_hash_id_to_text, **self.structured_node_texts}
         
         passage_hash_ids = set(passage_hash_id_to_text.keys())
         
         for hash_id, text in all_hash_id_to_text.items():
             if hash_id not in existing_nodes:
-                self.graph.add_vertex(name=hash_id, content=text)
+                node_type = self.structured_node_types.get(hash_id)
+                if node_type:
+                    self.graph.add_vertex(name=hash_id, content=text, node_type=node_type)
+                else:
+                    self.graph.add_vertex(name=hash_id, content=text)
         
         self.node_name_to_vertex_idx = {v["name"]: v.index for v in self.graph.vs if "name" in v.attributes()}   
         self.passage_node_indices = [
@@ -621,15 +1007,21 @@ class LinearRAG:
     def add_edges(self):
         edges = []
         weights = []
+        valid_nodes = set(self.node_name_to_vertex_idx.keys())
         
         for node_hash_id, node_to_node_stats in self.node_to_node_stats.items():
+            if node_hash_id not in valid_nodes:
+                continue
             for neighbor_hash_id, weight in node_to_node_stats.items():
                 if node_hash_id == neighbor_hash_id:
                     continue
+                if neighbor_hash_id not in valid_nodes:
+                    continue
                 edges.append((node_hash_id, neighbor_hash_id))
                 weights.append(weight)
-        self.graph.add_edges(edges)
-        self.graph.es['weight'] = weights
+        if edges:
+            self.graph.add_edges(edges)
+            self.graph.es['weight'] = weights
 
     def add_entity_to_passage_edges(self, passage_hash_id_to_entities):
         passage_to_entity_count ={} 

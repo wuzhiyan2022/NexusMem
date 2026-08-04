@@ -21,6 +21,13 @@ class LinearRAGConfig:
     use_vectorized_retrieval: bool = False  # True for vectorized matrix computation, False for BFS iteration
     enable_hybrid_attribute_fallback: bool = False
     attribute_keyword_boost: float = 0.25
+    enable_structured_memory_graph: bool = True
+    structured_node_top_k: int = 24
+    structured_node_weight: float = 0.35
+    structured_event_weight: float = 1.0
+    structured_memory_weight: float = 0.9
+    structured_time_weight: float = 0.8
+    structured_score_threshold: float = 0.2
     attribute_query_keywords: list[str] = field(default_factory=lambda: [
         "born", "birth", "where", "when", "located", "location", "founded", "founder",
         "died", "death", "nationality", "capital", "date", "year"

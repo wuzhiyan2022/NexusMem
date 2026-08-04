@@ -16,6 +16,7 @@ from sentence_transformers import SentenceTransformer
 
 from src.LinearRAG import LinearRAG
 from src.config import LinearRAGConfig
+from src.memory_layer import MemoryLayer
 from src.ner import SpacyNER
 
 
@@ -88,6 +89,17 @@ class LinearRAGMemoryService:
         self.min_score = self._optional_float(os.getenv("LINEARRAG_MIN_SCORE"))
         self.use_vectorized_retrieval = self._env_bool("LINEARRAG_USE_VECTORIZED_RETRIEVAL", False)
         self.enable_attribute_fallback = self._env_bool("LINEARRAG_ENABLE_ATTRIBUTE_FALLBACK", True)
+        self.enable_memory_layer = self._env_bool("LINEARRAG_ENABLE_MEMORY_LAYER", True)
+        self.enable_status_rerank = self._env_bool("LINEARRAG_ENABLE_STATUS_RERANK", True)
+        self.enable_structured_memory_graph = self._env_bool("LINEARRAG_ENABLE_STRUCTURED_MEMORY_GRAPH", True)
+        self.structured_node_top_k = int(os.getenv("LINEARRAG_STRUCTURED_NODE_TOP_K", "24"))
+        self.structured_node_weight = float(os.getenv("LINEARRAG_STRUCTURED_NODE_WEIGHT", "0.35"))
+        self.structured_event_weight = float(os.getenv("LINEARRAG_STRUCTURED_EVENT_WEIGHT", "1.0"))
+        self.structured_memory_weight = float(os.getenv("LINEARRAG_STRUCTURED_MEMORY_WEIGHT", "0.9"))
+        self.structured_time_weight = float(os.getenv("LINEARRAG_STRUCTURED_TIME_WEIGHT", "0.8"))
+        self.structured_score_threshold = float(os.getenv("LINEARRAG_STRUCTURED_SCORE_THRESHOLD", "0.2"))
+        self.rerank_candidate_multiplier = int(os.getenv("LINEARRAG_RERANK_CANDIDATE_MULTIPLIER", "3"))
+        self.rerank_max_candidates = int(os.getenv("LINEARRAG_RERANK_MAX_CANDIDATES", "300"))
 
         self.users_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -127,7 +139,7 @@ class LinearRAGMemoryService:
             if request.request_id in processed:
                 return self._add_response(request)
 
-            passages = self._build_passages(request, int(meta.get("next_seq", 0)))
+            passages = self._build_passages_for_index(user_key, request, int(meta.get("next_seq", 0)))
             if passages:
                 rag = self._new_rag(user_key)
                 rag.index(passages)
@@ -153,7 +165,8 @@ class LinearRAGMemoryService:
                 return {"data": []}
 
             query = self._query_text(request)
-            rag.config.retrieval_top_k = limit
+            retrieve_limit = self._retrieve_limit(limit)
+            rag.config.retrieval_top_k = retrieve_limit
             results = rag.retrieve([{"question": query, "answer": ""}])[0]
             passages = results.get("sorted_passage", [])
             scores = results.get("sorted_passage_scores", [])
@@ -163,7 +176,8 @@ class LinearRAGMemoryService:
 
             data = []
             seen_ids: set[str] = set()
-            for passage, score in zip(passages, scores):
+            ranked_results = self._rank_search_results(user_key, query, passages, scores)
+            for passage, score in ranked_results:
                 memory_id = rag.passage_embedding_store.text_to_hash_id.get(passage)
                 if memory_id is None:
                     memory_id = "passage-" + hashlib.sha256(passage.encode("utf-8")).hexdigest()
@@ -220,6 +234,19 @@ class LinearRAGMemoryService:
             json.dump(meta, handle, ensure_ascii=False, indent=2)
         tmp_path.replace(meta_path)
 
+    def _build_passages_for_index(self, user_key: str, request: AddRequest, start_seq: int) -> list[str]:
+        if not self.enable_memory_layer:
+            return self._build_passages(request, start_seq)
+
+        layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
+        return layer.build_passages(
+            request,
+            self._split_content,
+            start_seq,
+            self._split_sentences,
+            self._extract_event_candidates,
+        )
+
     def _build_passages(self, request: AddRequest, start_seq: int) -> list[str]:
         passages: list[str] = []
         seq = start_seq
@@ -269,6 +296,22 @@ class LinearRAGMemoryService:
             chunks.append("".join(current).strip())
         return [chunk for chunk in chunks if chunk]
 
+    def _split_sentences(self, content: str) -> list[str]:
+        try:
+            doc = self.spacy_ner.spacy_model(content)
+            sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+            return sentences or [content]
+        except Exception:
+            return MemoryLayer._split_sentences(content)
+
+    def _extract_event_candidates(self, sentence: str) -> list[dict[str, Any]]:
+        try:
+            doc = self.spacy_ner.spacy_model(sentence)
+            candidates = MemoryLayer.event_candidates_from_spacy(doc)
+            return candidates or MemoryLayer._event_candidates(sentence)
+        except Exception:
+            return MemoryLayer._event_candidates(sentence)
+
     def _new_rag(self, user_key: str) -> LinearRAG:
         config = LinearRAGConfig(
             dataset_name=user_key,
@@ -280,6 +323,13 @@ class LinearRAGMemoryService:
             retrieval_top_k=self.default_top_k,
             use_vectorized_retrieval=self.use_vectorized_retrieval,
             enable_hybrid_attribute_fallback=self.enable_attribute_fallback,
+            enable_structured_memory_graph=self.enable_structured_memory_graph,
+            structured_node_top_k=self.structured_node_top_k,
+            structured_node_weight=self.structured_node_weight,
+            structured_event_weight=self.structured_event_weight,
+            structured_memory_weight=self.structured_memory_weight,
+            structured_time_weight=self.structured_time_weight,
+            structured_score_threshold=self.structured_score_threshold,
         )
         config.spacy_ner = self.spacy_ner
         return LinearRAG(config)
@@ -313,6 +363,38 @@ class LinearRAGMemoryService:
             if options:
                 query = f"{query}\nOptions:\n{options}"
         return query
+
+    def _retrieve_limit(self, limit: int) -> int:
+        if not (self.enable_memory_layer and self.enable_status_rerank):
+            return limit
+        multiplier = max(1, self.rerank_candidate_multiplier)
+        max_candidates = max(limit, self.rerank_max_candidates)
+        return min(max_candidates, max(limit, limit * multiplier))
+
+    def _rank_search_results(
+        self,
+        user_key: str,
+        query: str,
+        passages: list[str],
+        scores: list[float],
+    ) -> list[tuple[str, float]]:
+        ranked = [(passage, float(score)) for passage, score in zip(passages, scores)]
+        if not (self.enable_memory_layer and self.enable_status_rerank):
+            return ranked
+
+        try:
+            layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
+            raw_status = layer.load_raw_memory_status()
+            intent = MemoryLayer.query_intent(query)
+            adjusted = []
+            for passage, score in ranked:
+                raw_id = MemoryLayer.parse_raw_id(passage)
+                status_info = raw_status.get(raw_id) if raw_id else None
+                adjusted.append((passage, MemoryLayer.adjust_score(score, status_info, intent)))
+            adjusted.sort(key=lambda item: item[1], reverse=True)
+            return adjusted
+        except Exception:
+            return ranked
 
     @staticmethod
     def _strip_internal_prefix(passage: str) -> str:
