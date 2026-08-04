@@ -497,7 +497,8 @@ class MemoryLayer:
             )
         ]
 
-    def _event_candidates(self, sentence: str) -> list[dict[str, Any]]:
+    @classmethod
+    def _event_candidates(cls, sentence: str) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         event_verbs = (
             "moved|went|visited|traveled|travelled|met|joined|left|started|finished|completed|"
@@ -513,15 +514,15 @@ class MemoryLayer:
             if not match:
                 continue
             trigger = match.group("trigger")
-            object_text = self._clean_event_object(match.group("object"))
+            object_text = cls._clean_event_object(match.group("object"))
             if not object_text and trigger.lower() not in {"graduated", "married", "divorced"}:
                 continue
-            subject = self._event_subject(match.group("subject"))
+            subject = cls._event_subject(match.group("subject"))
             candidates.append(
-                self._candidate(
+                cls._candidate(
                     memory_type="event",
                     subject=subject,
-                    predicate=self._canonical_event_trigger(trigger),
+                    predicate=cls._canonical_event_trigger(trigger),
                     object_text=object_text or trigger,
                     polarity="neutral",
                     pattern="event",
