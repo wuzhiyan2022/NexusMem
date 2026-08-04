@@ -24,6 +24,7 @@ class Message(BaseModel):
     role: str
     content: str
     timestamp: int | float | str | None = None
+    speaker: str | None = None
 
     class Config:
         extra = "ignore"
@@ -245,6 +246,7 @@ class LinearRAGMemoryService:
             start_seq,
             self._split_sentences,
             self._extract_event_candidates,
+            self._extract_generic_memory_candidates,
         )
 
     def _build_passages(self, request: AddRequest, start_seq: int) -> list[str]:
@@ -311,6 +313,13 @@ class LinearRAGMemoryService:
             return candidates or MemoryLayer._event_candidates(sentence)
         except Exception:
             return MemoryLayer._event_candidates(sentence)
+
+    def _extract_generic_memory_candidates(self, sentence: str, speaker: str) -> list[dict[str, Any]]:
+        try:
+            doc = self.spacy_ner.spacy_model(sentence)
+            return MemoryLayer.generic_candidates_from_spacy(doc, speaker=speaker)
+        except Exception:
+            return []
 
     def _new_rag(self, user_key: str) -> LinearRAG:
         config = LinearRAGConfig(

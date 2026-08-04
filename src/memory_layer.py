@@ -151,6 +151,7 @@ class MemoryLayer:
         start_seq: int,
         split_sentences: Callable[[str], list[str]] | None = None,
         extract_events: Callable[[str], list[dict[str, Any]]] | None = None,
+        extract_generic_memories: Callable[[str, str], list[dict[str, Any]]] | None = None,
     ) -> list[str]:
         self.user_dir.mkdir(parents=True, exist_ok=True)
         consolidated = self._load_consolidated()
@@ -159,6 +160,7 @@ class MemoryLayer:
 
         for message_index, message in enumerate(request.messages):
             role = (message.role or "").strip() or "unknown"
+            speaker = str(getattr(message, "speaker", "") or "").strip()
             content = (message.content or "").strip()
             if not content:
                 continue
@@ -184,6 +186,8 @@ class MemoryLayer:
                     part_index=part_index,
                     split_sentences=split_sentences,
                     extract_events=extract_events,
+                    extract_generic_memories=extract_generic_memories,
+                    speaker=speaker,
                 )
                 raw_records.append(
                     {
@@ -194,6 +198,7 @@ class MemoryLayer:
                         "message_index": message_index,
                         "part_index": part_index,
                         "role": role,
+                        "speaker": speaker,
                         "timestamp": timestamp,
                         "content": part,
                         "candidate_ids": [candidate["candidate_id"] for candidate in raw_candidates],
@@ -226,6 +231,8 @@ class MemoryLayer:
                 f"[part_index={raw['part_index']}]",
                 f"[role={raw['role']}]",
             ]
+            if raw.get("speaker"):
+                header_parts.append(f"[speaker={raw['speaker']}]")
             if raw["timestamp"]:
                 header_parts.append(f"[timestamp={raw['timestamp']}]")
             if summary.get("memory_ids"):
@@ -296,6 +303,46 @@ class MemoryLayer:
 
         return score * factor
 
+    @staticmethod
+    def _actor_subject(speaker: str, role: str) -> str:
+        speaker = str(speaker or "").strip()
+        if speaker:
+            return speaker
+        role = str(role or "").strip()
+        return role or "user"
+
+    @staticmethod
+    def _resolve_candidate_subject(candidate: dict[str, Any], actor: str) -> None:
+        subject = str(candidate.get("subject") or "").strip()
+        lowered = subject.lower()
+        actor = str(actor or "").strip() or "user"
+        if lowered in {"user", "i", "me", "myself", "we", "us", "ourselves"}:
+            candidate["subject"] = actor
+            return
+        if lowered.startswith("my "):
+            candidate["subject"] = f"{actor}'s {subject[3:].strip()}"
+            return
+        if lowered.startswith("our "):
+            candidate["subject"] = f"{actor}'s {subject[4:].strip()}"
+
+    @staticmethod
+    def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str, str, str]] = set()
+        unique: list[dict[str, Any]] = []
+        for candidate in candidates:
+            key = (
+                str(candidate.get("memory_type") or ""),
+                str(candidate.get("subject") or "").lower(),
+                str(candidate.get("predicate") or "").lower(),
+                str(candidate.get("object") or "").lower(),
+                str(candidate.get("polarity") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
     def _extract_candidates(
         self,
         text: str,
@@ -310,9 +357,12 @@ class MemoryLayer:
         part_index: int,
         split_sentences: Callable[[str], list[str]] | None = None,
         extract_events: Callable[[str], list[dict[str, Any]]] | None = None,
+        extract_generic_memories: Callable[[str, str], list[dict[str, Any]]] | None = None,
+        speaker: str = "",
     ) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         sentence_splitter = split_sentences or self._split_sentences
+        actor = self._actor_subject(speaker, role)
         for sentence_index, sentence in enumerate(sentence_splitter(text)):
             sentence_candidates: list[dict[str, Any]] = []
             sentence_candidates.extend(self._preference_candidates(sentence))
@@ -323,8 +373,12 @@ class MemoryLayer:
                 sentence_candidates.extend(extract_events(sentence))
             else:
                 sentence_candidates.extend(self._event_candidates(sentence))
+            if extract_generic_memories is not None:
+                sentence_candidates.extend(extract_generic_memories(sentence, actor))
+            sentence_candidates = self._dedupe_candidates(sentence_candidates)
 
             for candidate in sentence_candidates:
+                self._resolve_candidate_subject(candidate, actor)
                 time_expressions = self._extract_time_expressions(sentence, timestamp)
                 for time_expression in candidate.get("time_expressions") or []:
                     self._append_unique(time_expressions, time_expression)
@@ -584,6 +638,309 @@ class MemoryLayer:
                 }
             )
         return candidates
+
+    @classmethod
+    def generic_candidates_from_spacy(cls, doc: Any, *, speaker: str = "user") -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        text = getattr(doc, "text", "")
+        actor = cls._actor_subject(speaker, "user")
+        spacy_times = [
+            ent.text
+            for ent in getattr(doc, "ents", [])
+            if getattr(ent, "label_", "") in {"DATE", "TIME"}
+        ]
+
+        for token in doc:
+            predicate_info = cls._generic_predicate_info(token)
+            if predicate_info is None:
+                continue
+            memory_type, predicate, polarity = predicate_info
+            subject = cls._normalize_generic_subject(cls._find_generic_subject(token), actor)
+            if not cls._is_informative_subject(subject):
+                continue
+            object_text = cls._generic_object_for_token(token, predicate)
+            object_text = cls._clean_object(object_text)
+            if not cls._is_informative_object(object_text):
+                continue
+            candidates.append(
+                cls._candidate(
+                    memory_type=memory_type,
+                    subject=subject,
+                    predicate=predicate,
+                    object_text=object_text,
+                    polarity=polarity,
+                    pattern=f"generic_spacy_{predicate}",
+                )
+                | {
+                    "time_expressions": spacy_times,
+                    "source_text": text,
+                }
+            )
+
+        candidates.extend(cls._generic_noun_chunk_candidates(doc, actor, spacy_times))
+        if not candidates:
+            fallback = cls._generic_observation_candidate(doc, actor, spacy_times)
+            if fallback is not None:
+                candidates.append(fallback)
+        return cls._dedupe_candidates(candidates)
+
+    @classmethod
+    def _generic_predicate_info(cls, token: Any) -> tuple[str, str, str] | None:
+        lemma = str(getattr(token, "lemma_", "") or getattr(token, "text", "")).lower()
+        text = str(getattr(token, "text", "") or "").lower()
+        pos = str(getattr(token, "pos_", ""))
+
+        if lemma in {"like", "love", "prefer", "enjoy", "appreciate", "adore"}:
+            polarity = "negative" if cls._has_negation(token) else "positive"
+            return "preference", "preference", polarity
+        if lemma in {"hate", "dislike"}:
+            return "preference", "preference", "negative"
+        if lemma in {"keen", "interested", "fond"} or text == "into":
+            return "preference", "preference", "positive"
+        if lemma == "fan":
+            return "preference", "preference", "positive"
+
+        if lemma in {"live", "reside", "relocate"}:
+            return "fact", "current_location", "neutral"
+        if lemma in {"base", "locate"} and cls._has_child_prep(token, {"at", "in"}):
+            return "fact", "current_location", "neutral"
+        if lemma == "move" and cls._has_child_prep(token, {"to", "into", "in"}):
+            return "fact", "current_location", "neutral"
+        if lemma in {"work", "employ"}:
+            return "fact", "workplace", "neutral"
+        if lemma in {"study", "learn", "attend", "graduate"}:
+            return "fact", "education", "neutral"
+        if lemma in {"have", "own"}:
+            return "fact", "has", "neutral"
+        if lemma == "get" and not cls._has_negation(token):
+            return "fact", "has", "neutral"
+        if lemma in {"want", "plan", "hope", "intend", "expect", "consider"}:
+            return "fact", "plan", "neutral"
+        if lemma == "think" and cls._has_child_prep(token, {"about", "of"}):
+            return "fact", "plan", "neutral"
+
+        if cls._is_copular_head(token):
+            if pos in {"NOUN", "PROPN"}:
+                if lemma in {"fan"}:
+                    return "preference", "preference", "positive"
+                return "fact", "identity", "neutral"
+            if pos == "ADJ":
+                if lemma in {"keen", "interested", "fond"} or text == "into":
+                    return "preference", "preference", "positive"
+                return "fact", "state", "neutral"
+
+        if pos == "VERB" and cls._is_event_verb_token(token):
+            return "event", cls._canonical_event_trigger(lemma), "neutral"
+        return None
+
+    @classmethod
+    def _generic_object_for_token(cls, token: Any, predicate: str) -> str:
+        if predicate == "preference":
+            prep_object = cls._prep_object_text(token, {"about", "for", "in", "into", "of", "on", "with"})
+            if prep_object:
+                return prep_object
+        if predicate == "current_location":
+            prep_object = cls._prep_object_text(token, {"at", "from", "in", "into", "to"})
+            if prep_object:
+                return prep_object
+        if predicate == "workplace":
+            prep_object = cls._prep_object_text(token, {"at", "for", "in", "with"})
+            if prep_object:
+                return prep_object
+        if predicate == "education":
+            prep_object = cls._prep_object_text(token, {"at", "from", "in"})
+            if prep_object:
+                return prep_object
+        if predicate == "state" and cls._is_copular_head(token):
+            return cls._subtree_without_deps(token, {"aux", "auxpass", "cop", "nsubj", "nsubjpass", "punct"})
+
+        for child in getattr(token, "children", []):
+            if getattr(child, "dep_", "") in {"dobj", "obj", "attr", "dative", "oprd"}:
+                return cls._subtree_text(child)
+        prep_object = cls._prep_object_text(token, {"about", "at", "for", "from", "in", "into", "of", "on", "to", "with"})
+        if prep_object:
+            return prep_object
+        for child in getattr(token, "children", []):
+            if getattr(child, "dep_", "") in {"xcomp", "ccomp", "acl"}:
+                return cls._subtree_text(child)
+        if cls._is_copular_head(token):
+            return cls._subtree_without_deps(token, {"aux", "auxpass", "cop", "nsubj", "nsubjpass", "punct"})
+        return ""
+
+    @classmethod
+    def _generic_noun_chunk_candidates(
+        cls,
+        doc: Any,
+        actor: str,
+        spacy_times: list[str],
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        relation_nouns = {
+            "assistant", "boss", "brother", "child", "classmate", "colleague", "coworker",
+            "daughter", "doctor", "family", "father", "friend", "husband", "kid", "manager",
+            "mentor", "mother", "partner", "pet", "roommate", "sister", "son", "teacher", "wife",
+        }
+        for chunk in cls._safe_noun_chunks(doc):
+            root = getattr(chunk, "root", None)
+            if root is None:
+                continue
+            possessor = ""
+            for child in getattr(root, "children", []):
+                if getattr(child, "dep_", "") == "poss":
+                    possessor = cls._normalize_generic_subject(cls._subtree_text(child), actor)
+                    break
+            if not possessor:
+                continue
+            root_lemma = str(getattr(root, "lemma_", "") or getattr(root, "text", "")).lower()
+            chunk_text = cls._clean_object(getattr(chunk, "text", ""))
+            if not chunk_text or root_lemma in {"thing", "way", "one", "time"}:
+                continue
+            predicate = f"relation:{root_lemma}" if root_lemma in relation_nouns else f"has:{root_lemma}"
+            memory_type = "relation" if root_lemma in relation_nouns else "fact"
+            object_text = re.sub(r"^(?:my|our|his|her|their|its)\s+", "", chunk_text, flags=re.IGNORECASE).strip()
+            if not cls._is_informative_object(object_text):
+                continue
+            candidates.append(
+                cls._candidate(
+                    memory_type=memory_type,
+                    subject=possessor,
+                    predicate=predicate,
+                    object_text=object_text,
+                    polarity="neutral",
+                    pattern="generic_spacy_noun_chunk",
+                )
+                | {
+                    "time_expressions": spacy_times,
+                    "source_text": getattr(doc, "text", ""),
+                }
+            )
+        return candidates
+
+    @classmethod
+    def _generic_observation_candidate(
+        cls,
+        doc: Any,
+        actor: str,
+        spacy_times: list[str],
+    ) -> dict[str, Any] | None:
+        text = cls._clean_object(getattr(doc, "text", ""))
+        lowered = text.lower()
+        if not text or len(text) < 16 or len(text) > 320:
+            return None
+        if "?" in text:
+            return None
+        if re.match(r"^(?:hey|hi|hello|thanks|thank you|wow|yeah|yep|nope|okay|ok)\b", lowered):
+            return None
+        has_memory_signal = bool(spacy_times or getattr(doc, "ents", []))
+        if not has_memory_signal:
+            has_memory_signal = any(
+                str(getattr(token, "text", "")).lower() in {"i", "me", "my", "mine", "we", "our", "ours"}
+                for token in doc
+            )
+        if not has_memory_signal:
+            has_memory_signal = bool(cls._safe_noun_chunks(doc))
+        if not has_memory_signal:
+            return None
+        return (
+            cls._candidate(
+                memory_type="observation",
+                subject=actor,
+                predicate="observation",
+                object_text=text,
+                polarity="neutral",
+                pattern="generic_spacy_observation",
+            )
+            | {
+                "time_expressions": spacy_times,
+                "source_text": text,
+            }
+        )
+
+    @staticmethod
+    def _safe_noun_chunks(doc: Any) -> list[Any]:
+        try:
+            return list(getattr(doc, "noun_chunks", []))
+        except Exception:
+            return []
+
+    @classmethod
+    def _find_generic_subject(cls, token: Any) -> str:
+        for node in [token, *list(getattr(token, "ancestors", []))]:
+            for child in getattr(node, "children", []):
+                if getattr(child, "dep_", "") in {"nsubj", "nsubjpass", "csubj", "csubjpass"}:
+                    return cls._subtree_text(child)
+        return ""
+
+    @staticmethod
+    def _normalize_generic_subject(subject: str, actor: str) -> str:
+        subject = str(subject or "").strip()
+        actor = str(actor or "").strip() or "user"
+        lowered = subject.lower()
+        if lowered in {"i", "me", "myself", "we", "us", "ourselves"}:
+            return actor
+        if lowered in {"my", "mine", "our", "ours"}:
+            return actor
+        if lowered.startswith("my "):
+            return f"{actor}'s {subject[3:].strip()}"
+        if lowered.startswith("our "):
+            return f"{actor}'s {subject[4:].strip()}"
+        return subject
+
+    @staticmethod
+    def _is_informative_subject(subject: str) -> bool:
+        lowered = str(subject or "").strip().lower()
+        return bool(lowered) and lowered not in {
+            "it", "that", "this", "there", "here", "what", "which", "who", "anything",
+            "something", "everything", "nothing",
+        }
+
+    @staticmethod
+    def _is_informative_object(object_text: str) -> bool:
+        lowered = str(object_text or "").strip().lower()
+        return bool(lowered) and lowered not in {
+            "it", "that", "this", "there", "here", "me", "you", "him", "her", "them",
+            "us", "one", "thing", "things", "something", "anything",
+        }
+
+    @staticmethod
+    def _has_negation(token: Any) -> bool:
+        return any(getattr(child, "dep_", "") == "neg" for child in getattr(token, "children", []))
+
+    @staticmethod
+    def _has_child_prep(token: Any, preps: set[str]) -> bool:
+        return any(
+            getattr(child, "dep_", "") == "prep" and str(getattr(child, "lemma_", "") or getattr(child, "text", "")).lower() in preps
+            for child in getattr(token, "children", [])
+        )
+
+    @staticmethod
+    def _is_copular_head(token: Any) -> bool:
+        children = list(getattr(token, "children", []))
+        return any(getattr(child, "dep_", "") in {"cop", "aux"} for child in children) and any(
+            getattr(child, "dep_", "") in {"nsubj", "nsubjpass", "csubj", "csubjpass"} for child in children
+        )
+
+    @classmethod
+    def _prep_object_text(cls, token: Any, preps: set[str]) -> str:
+        for child in getattr(token, "children", []):
+            child_text = str(getattr(child, "lemma_", "") or getattr(child, "text", "")).lower()
+            if getattr(child, "dep_", "") != "prep" or child_text not in preps:
+                continue
+            for grandchild in getattr(child, "children", []):
+                if getattr(grandchild, "dep_", "") in {"pobj", "obj", "pcomp"}:
+                    return cls._subtree_text(grandchild)
+        return ""
+
+    @staticmethod
+    def _subtree_without_deps(token: Any, excluded_deps: set[str]) -> str:
+        pieces = []
+        for item in sorted(list(getattr(token, "subtree", [token])), key=lambda value: getattr(value, "i", 0)):
+            if getattr(item, "dep_", "") in excluded_deps:
+                continue
+            text = str(getattr(item, "text", "")).strip()
+            if text:
+                pieces.append(text)
+        return " ".join(pieces).strip()
 
     @classmethod
     def _is_event_verb_token(cls, token: Any) -> bool:
@@ -984,6 +1341,9 @@ class MemoryLayer:
         now = int(time.time())
 
         for candidate in candidates:
+            for time_expression in candidate.get("time_expressions") or []:
+                time_node = self._time_node(time_expression, candidate.get("timestamp") or "")
+                time_nodes_by_id[time_node["time_id"]] = time_node
             if candidate.get("memory_type") != "event":
                 continue
             event_id = candidate.get("event_id") or self._event_id(candidate)
@@ -1007,7 +1367,6 @@ class MemoryLayer:
 
             for time_expression in candidate.get("time_expressions") or []:
                 time_node = self._time_node(time_expression, candidate.get("timestamp") or "")
-                time_nodes_by_id[time_node["time_id"]] = time_node
                 graph_edges.append(self._graph_edge(event_id, "occurs_at", time_node["time_id"], candidate))
 
             for participant in candidate.get("event_participants") or []:
