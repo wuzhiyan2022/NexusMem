@@ -96,6 +96,14 @@ class MemoryLayer:
         "大概",
         "不确定",
     }
+    CONFIDENCE_BASE_BY_SOURCE = {
+        "exact_rule": 0.82,
+        "event_spacy": 0.74,
+        "generic_spacy": 0.66,
+        "generic_noun_chunk": 0.56,
+        "observation": 0.30,
+        "unknown": 0.45,
+    }
     SINGLE_VALUE_PREDICATES = {
         "current_location",
         "workplace",
@@ -678,10 +686,6 @@ class MemoryLayer:
             )
 
         candidates.extend(cls._generic_noun_chunk_candidates(doc, actor, spacy_times))
-        if not candidates:
-            fallback = cls._generic_observation_candidate(doc, actor, spacy_times)
-            if fallback is not None:
-                candidates.append(fallback)
         return cls._dedupe_candidates(candidates)
 
     @classmethod
@@ -1245,19 +1249,39 @@ class MemoryLayer:
         return float(match.group(0)) if match else 0.0
 
     def _confidence(self, candidate: dict[str, Any]) -> float:
-        score = 0.45
-        if candidate.get("pattern"):
-            score += 0.25
+        confidence_source = self._confidence_source(candidate)
+        score = self.CONFIDENCE_BASE_BY_SOURCE.get(
+            confidence_source,
+            self.CONFIDENCE_BASE_BY_SOURCE["unknown"],
+        )
         if candidate.get("object"):
-            score += 0.1
+            score += 0.04
         if candidate.get("time_expressions") or candidate.get("timestamp"):
-            score += 0.05
+            score += 0.03
         if candidate.get("update_signal"):
-            score += 0.05
+            score += 0.04
         source = str(candidate.get("source_text", "")).lower()
         if any(hint in source for hint in self.UNCERTAINTY_HINTS):
             score -= 0.18
+        if confidence_source == "observation":
+            return max(0.0, min(0.44, score))
         return max(0.0, min(0.95, score))
+
+    @staticmethod
+    def _confidence_source(candidate: dict[str, Any]) -> str:
+        memory_type = str(candidate.get("memory_type") or "").lower()
+        pattern = str(candidate.get("pattern") or "").lower()
+        if memory_type == "observation" or pattern == "generic_spacy_observation":
+            return "observation"
+        if pattern == "generic_spacy_noun_chunk":
+            return "generic_noun_chunk"
+        if pattern.startswith("generic_spacy_"):
+            return "generic_spacy"
+        if pattern == "event_spacy_verb":
+            return "event_spacy"
+        if pattern:
+            return "exact_rule"
+        return "unknown"
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:
