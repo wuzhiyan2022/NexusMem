@@ -109,6 +109,7 @@ def iter_messages(conversation: dict[str, Any], *, include_multimodal: bool) -> 
             messages.append(
                 {
                     "role": str(message.get("role") or "user"),
+                    "speaker": str(message.get("speaker") or "").strip() or None,
                     "timestamp": str(message.get("session_date_time") or date_time or ""),
                     "content": content,
                     "_session_id": session_id,

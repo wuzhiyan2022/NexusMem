@@ -192,10 +192,12 @@ class MemoryLayer:
 
         for message_index, message in enumerate(request.messages):
             role = (message.role or "").strip() or "unknown"
-            speaker = str(getattr(message, "speaker", "") or "").strip()
             content = (message.content or "").strip()
             if not content:
                 continue
+            speaker = str(getattr(message, "speaker", "") or "").strip()
+            if not speaker:
+                speaker = self._speaker_from_content(content)
             timestamp = "" if message.timestamp is None else str(message.timestamp)
             for part_index, part in enumerate(split_content(content)):
                 order_index = start_seq + len(raw_records)
@@ -223,6 +225,8 @@ class MemoryLayer:
                     extract_llm_structured=extract_llm_structured,
                     speaker=speaker,
                 )
+                content_metadata = self._content_metadata(part)
+                part_speaker = speaker or content_metadata.get("speaker", "")
                 raw_records.append(
                     {
                         "raw_id": raw_id,
@@ -232,10 +236,13 @@ class MemoryLayer:
                         "message_index": message_index,
                         "part_index": part_index,
                         "role": role,
-                        "speaker": speaker,
+                        "speaker": part_speaker,
                         "timestamp": timestamp,
                         "order_index": order_index,
                         "content": part,
+                        "dia_id": content_metadata.get("dia_id", ""),
+                        "source_session_index": content_metadata.get("session_index", ""),
+                        "source_message_index": content_metadata.get("message_index", ""),
                         "temporal_profile": self.temporal_profile(part, timestamp, order_index),
                         "candidate_ids": [candidate["candidate_id"] for candidate in raw_candidates],
                         "candidate_count": len(raw_candidates),
@@ -294,9 +301,20 @@ class MemoryLayer:
                         int(record.get("order_index") or index),
                     )
                 profile = dict(profile)
+                content_metadata = self._content_metadata(str(record.get("content") or ""))
                 profile.setdefault("raw_id", raw_id)
                 profile.setdefault("message_timestamp", str(record.get("timestamp") or ""))
                 profile.setdefault("order_index", int(record.get("order_index") or index))
+                profile.setdefault("dia_id", str(record.get("dia_id") or content_metadata.get("dia_id", "")))
+                profile.setdefault(
+                    "source_session_index",
+                    str(record.get("source_session_index") or content_metadata.get("session_index", "")),
+                )
+                profile.setdefault(
+                    "source_message_index",
+                    str(record.get("source_message_index") or content_metadata.get("message_index", "")),
+                )
+                profile.setdefault("speaker", str(record.get("speaker") or content_metadata.get("speaker", "")))
                 profiles[raw_id] = profile
         return profiles
 
@@ -355,6 +373,36 @@ class MemoryLayer:
             return speaker
         role = str(role or "").strip()
         return role or "user"
+
+    @classmethod
+    def _speaker_from_content(cls, content: str) -> str:
+        return cls._content_metadata(content).get("speaker", "")
+
+    @staticmethod
+    def _content_metadata(content: str) -> dict[str, str]:
+        text = str(content or "")
+
+        def bracket_value(name: str) -> str:
+            match = re.search(rf"\[{re.escape(name)}=([^\]\s]+)\]", text)
+            return match.group(1).strip() if match else ""
+
+        speaker = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", stripped).strip()
+            match = re.match(r"^([A-Z][A-Za-z0-9 ._'-]{0,60}):\s+", stripped)
+            if match:
+                speaker = match.group(1).strip()
+                break
+
+        return {
+            "dia_id": bracket_value("dia_id"),
+            "session_index": bracket_value("session_index"),
+            "message_index": bracket_value("message_index"),
+            "speaker": speaker,
+        }
 
     @staticmethod
     def _resolve_candidate_subject(candidate: dict[str, Any], actor: str) -> None:

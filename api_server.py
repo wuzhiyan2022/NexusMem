@@ -124,6 +124,10 @@ class LinearRAGMemoryService:
         self.structured_score_threshold = float(os.getenv("LINEARRAG_STRUCTURED_SCORE_THRESHOLD", "0.2"))
         self.rerank_candidate_multiplier = int(os.getenv("LINEARRAG_RERANK_CANDIDATE_MULTIPLIER", "3"))
         self.rerank_max_candidates = int(os.getenv("LINEARRAG_RERANK_MAX_CANDIDATES", "300"))
+        self.enable_evidence_completion = self._env_bool("LINEARRAG_ENABLE_EVIDENCE_COMPLETION", True)
+        self.completion_anchor_top_n = int(os.getenv("LINEARRAG_COMPLETION_ANCHOR_TOP_N", "12"))
+        self.completion_window = int(os.getenv("LINEARRAG_COMPLETION_WINDOW", "2"))
+        self.completion_max_neighbors = int(os.getenv("LINEARRAG_COMPLETION_MAX_NEIGHBORS", "2"))
         self.enable_search_debug = self._env_bool("LINEARRAG_ENABLE_SEARCH_DEBUG", False)
         self.search_debug_path = Path(
             os.getenv("LINEARRAG_SEARCH_DEBUG_PATH", str(self.root / "search_debug.jsonl"))
@@ -193,7 +197,8 @@ class LinearRAGMemoryService:
             if limit == 0:
                 return {"data": []}
 
-            query = request.query.strip()
+            raw_query = request.query.strip()
+            query = self._query_text(request)
             retrieve_limit = self._retrieve_limit(limit)
             rag.config.retrieval_top_k = retrieve_limit
             results = rag.retrieve([{"question": query, "answer": ""}])[0]
@@ -205,7 +210,7 @@ class LinearRAGMemoryService:
 
             data = []
             seen_ids: set[str] = set()
-            ranked_results = self._rank_search_results(user_key, query, request.options or [], passages, scores)
+            ranked_results = self._rank_search_results(user_key, raw_query, request.options or [], passages, scores, limit)
             for passage, score in ranked_results:
                 memory_id = rag.passage_embedding_store.text_to_hash_id.get(passage)
                 if memory_id is None:
@@ -524,11 +529,13 @@ class LinearRAGMemoryService:
         options: list[str],
         passages: list[str],
         scores: list[float],
+        limit: int,
     ) -> list[tuple[str, float]]:
         ranked = [(passage, float(score)) for passage, score in zip(passages, scores)]
         if not ranked:
             return ranked
 
+        query_profile = self._query_evidence_profile(query, options)
         raw_status: dict[str, Any] = {}
         raw_temporal_profiles: dict[str, dict[str, Any]] = {}
         intent = MemoryLayer.query_intent(query)
@@ -565,6 +572,7 @@ class LinearRAGMemoryService:
                     query,
                     options,
                     passage,
+                    query_profile,
                     temporal_intent,
                     temporal_profile,
                     temporal_context,
@@ -572,6 +580,7 @@ class LinearRAGMemoryService:
                 )
             adjusted.append((passage, adjusted_score))
         adjusted.sort(key=lambda item: item[1], reverse=True)
+        adjusted = self._complete_neighbor_evidence(query_profile, adjusted, limit)
         self._write_search_debug(
             user_key,
             query,
@@ -590,12 +599,14 @@ class LinearRAGMemoryService:
         query: str,
         options: list[str],
         passage: str,
+        query_profile: dict[str, Any],
         temporal_intent: dict[str, Any] | None = None,
         temporal_profile: dict[str, Any] | None = None,
         temporal_context: dict[str, float] | None = None,
         anchor_context: dict[str, Any] | None = None,
     ) -> float:
-        content = self._strip_internal_prefix(passage)
+        metadata = self._passage_metadata(passage)
+        content = metadata.get("evidence_text") or self._strip_internal_prefix(passage)
         content_lower = content.lower()
         query_tokens = self._rerank_tokens(query)
         passage_tokens = self._rerank_tokens(content)
@@ -619,6 +630,9 @@ class LinearRAGMemoryService:
             factor += 0.05
 
         factor += self._best_option_match(options, passage_tokens, content_lower)
+        factor *= self._speaker_rerank_factor(query_profile, metadata)
+        factor *= self._semantic_evidence_factor(query_profile, passage_tokens, content_lower)
+        factor *= self._answer_type_rerank_factor(query_profile, content, metadata)
         factor *= self._target_rerank_factor(temporal_intent or {}, passage_tokens, content_lower)
         factor *= self._temporal_rerank_factor(
             temporal_intent or {},
@@ -627,6 +641,227 @@ class LinearRAGMemoryService:
             anchor_context or {},
         )
         return max(0.65, min(2.05, factor))
+
+    @classmethod
+    def _query_evidence_profile(cls, query: str, options: list[str]) -> dict[str, Any]:
+        query = str(query or "").strip()
+        option_text = " ".join(str(option) for option in options or [] if str(option).strip())
+        answer_type = "generic"
+        lowered = query.lower()
+        if re.search(r"\bhow long|since when|for how many\b", lowered):
+            answer_type = "duration"
+        elif re.search(r"\bwhen|what date|which date|what day|which day|what month|what year\b", lowered):
+            answer_type = "time"
+        elif re.search(r"\bwho\b", lowered):
+            answer_type = "person"
+        elif re.search(r"\bwhere\b", lowered):
+            answer_type = "location"
+        elif re.search(r"\bwhy\b", lowered):
+            answer_type = "reason"
+        elif re.search(r"\bidentity\b", lowered):
+            answer_type = "identity"
+        elif re.search(r"\brelationship|relation status|married|single\b", lowered):
+            answer_type = "relation"
+        elif re.search(r"^\s*(?:would|could|should|is|are|was|were|do|does|did|can)\b", lowered):
+            answer_type = "boolean"
+
+        target_speakers: list[str] = []
+        excluded = {
+            "what", "when", "where", "who", "why", "how", "which", "would", "could", "should",
+            "the", "a", "an", "options", "answer", "first", "second", "third", "fourth",
+            "january", "february", "march", "april", "may", "june", "july", "august",
+            "september", "october", "november", "december",
+        }
+        for match in re.finditer(r"\b([A-Z][a-z][A-Za-z'’-]{1,})(?:'s)?\b", query):
+            value = match.group(1).strip()
+            if value.lower() not in excluded and value not in target_speakers:
+                target_speakers.append(value)
+
+        speaker_tokens = set()
+        for speaker in target_speakers:
+            speaker_tokens |= cls._rerank_tokens(speaker)
+        topic_tokens = cls._rerank_tokens(f"{query} {option_text}") - speaker_tokens
+        return {
+            "answer_type": answer_type,
+            "target_speakers": target_speakers,
+            "target_speaker_tokens": speaker_tokens,
+            "topic_tokens": topic_tokens,
+        }
+
+    @classmethod
+    def _speaker_rerank_factor(cls, query_profile: dict[str, Any], metadata: dict[str, Any]) -> float:
+        target_speakers = [
+            cls._normalize_person_name(value)
+            for value in query_profile.get("target_speakers") or []
+            if cls._normalize_person_name(value)
+        ]
+        if not target_speakers:
+            return 1.0
+        speaker = cls._normalize_person_name(metadata.get("speaker", ""))
+        if not speaker:
+            return 0.96
+        if speaker in target_speakers:
+            return 1.24
+        return 0.90
+
+    @classmethod
+    def _semantic_evidence_factor(
+        cls,
+        query_profile: dict[str, Any],
+        passage_tokens: set[str],
+        content_lower: str,
+    ) -> float:
+        topic_tokens = set(query_profile.get("topic_tokens") or [])
+        if not topic_tokens:
+            return 1.0
+        overlap = topic_tokens & passage_tokens
+        coverage = len(overlap) / max(len(topic_tokens), 1)
+        factor = 1.0
+        if coverage >= 0.65:
+            factor += 0.34
+        elif coverage >= 0.40:
+            factor += 0.24
+        elif overlap:
+            factor += min(0.18, 0.05 * len(overlap) + 0.10 * coverage)
+        else:
+            factor -= 0.08
+
+        answer_type = str(query_profile.get("answer_type") or "")
+        if answer_type == "identity" and re.search(
+            r"\b(identity|transgender|gay|lesbian|bisexual|queer|nonbinary|single parent|mother|father|student|teacher|artist|writer|engineer|doctor|nurse)\b",
+            content_lower,
+        ):
+            factor += 0.10
+        return max(0.86, min(1.38, factor))
+
+    @classmethod
+    def _answer_type_rerank_factor(
+        cls,
+        query_profile: dict[str, Any],
+        content: str,
+        metadata: dict[str, Any],
+    ) -> float:
+        answer_type = str(query_profile.get("answer_type") or "generic")
+        lowered = content.lower()
+        factor = 1.0
+        if answer_type == "time":
+            has_text_time = cls._has_time_expression(content)
+            has_relative = cls._has_relative_time_expression(content)
+            if has_text_time:
+                factor += 0.12
+            if has_relative and metadata.get("session_time"):
+                factor += 0.08
+            if not has_text_time and not metadata.get("session_time"):
+                factor -= 0.05
+        elif answer_type == "duration":
+            if re.search(r"\b(?:for|since)\b|\b\d+\s+(?:years?|months?|weeks?|days?|hours?)\b", lowered):
+                factor += 0.14
+            else:
+                factor -= 0.04
+        elif answer_type == "location":
+            if re.search(r"\b(?:from|to|in|at|near|moved|move|home country|city|town|country|beach|mountains?|forest)\b", lowered):
+                factor += 0.08
+        elif answer_type == "reason":
+            if re.search(r"\b(?:because|since|so that|due to|thanks to|as a result|made me|helped me)\b", lowered):
+                factor += 0.08
+        elif answer_type == "relation":
+            if re.search(r"\b(?:single|married|wife|husband|partner|friend|family|colleague|parent|breakup|relationship)\b", lowered):
+                factor += 0.10
+        elif answer_type == "identity":
+            if re.search(r"\b(?:i am|i'm|as a|identity|transgender|gay|lesbian|bisexual|queer|woman|man|parent)\b", lowered):
+                factor += 0.10
+        return max(0.90, min(1.22, factor))
+
+    def _complete_neighbor_evidence(
+        self,
+        query_profile: dict[str, Any],
+        ranked: list[tuple[str, float]],
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        if not self.enable_evidence_completion or not ranked:
+            return ranked
+        window = max(0, int(self.completion_window))
+        anchor_top_n = max(0, int(self.completion_anchor_top_n))
+        max_neighbors = max(0, int(self.completion_max_neighbors))
+        if window == 0 or anchor_top_n == 0 or max_neighbors == 0:
+            return ranked
+
+        metadata_by_passage = {passage: self._passage_metadata(passage) for passage, _ in ranked}
+        original_order = {passage: index for index, (passage, _) in enumerate(ranked)}
+        boosted_scores = {passage: float(score) for passage, score in ranked}
+        anchors = ranked[: min(len(ranked), max(anchor_top_n, min(limit, anchor_top_n)))]
+
+        for anchor_passage, anchor_score in anchors:
+            anchor_meta = metadata_by_passage.get(anchor_passage) or {}
+            anchor_session = str(anchor_meta.get("session_index") or "")
+            anchor_message = self._metadata_int(anchor_meta.get("message_index"))
+            if not anchor_session or anchor_message is None:
+                continue
+
+            neighbors: list[tuple[int, float, str, float]] = []
+            for passage, score in ranked:
+                if passage == anchor_passage:
+                    continue
+                meta = metadata_by_passage.get(passage) or {}
+                if str(meta.get("session_index") or "") != anchor_session:
+                    continue
+                message_index = self._metadata_int(meta.get("message_index"))
+                if message_index is None:
+                    continue
+                distance = abs(message_index - anchor_message)
+                if distance < 1 or distance > window:
+                    continue
+                if not self._neighbor_speaker_allowed(query_profile, anchor_meta, meta):
+                    continue
+                fit = self._neighbor_fit_score(query_profile, meta)
+                neighbors.append((distance, -fit, passage, score))
+
+            neighbors.sort(key=lambda item: (item[0], item[1], original_order.get(item[2], 0)))
+            for distance, negative_fit, passage, _score in neighbors[:max_neighbors]:
+                fit = -negative_fit
+                candidate_factor = 0.96 - 0.06 * distance + 0.04 * fit
+                candidate_factor = max(0.72, min(0.96, candidate_factor))
+                boosted_scores[passage] = max(boosted_scores[passage], float(anchor_score) * candidate_factor)
+
+        ordered = sorted(
+            ranked,
+            key=lambda item: (boosted_scores.get(item[0], item[1]), -original_order.get(item[0], 0)),
+            reverse=True,
+        )
+        return [(passage, boosted_scores.get(passage, score)) for passage, score in ordered]
+
+    @classmethod
+    def _neighbor_speaker_allowed(
+        cls,
+        query_profile: dict[str, Any],
+        anchor_meta: dict[str, Any],
+        candidate_meta: dict[str, Any],
+    ) -> bool:
+        target_speakers = [
+            cls._normalize_person_name(value)
+            for value in query_profile.get("target_speakers") or []
+            if cls._normalize_person_name(value)
+        ]
+        candidate_speaker = cls._normalize_person_name(candidate_meta.get("speaker", ""))
+        if target_speakers:
+            return not candidate_speaker or candidate_speaker in target_speakers
+        anchor_speaker = cls._normalize_person_name(anchor_meta.get("speaker", ""))
+        return not anchor_speaker or not candidate_speaker or anchor_speaker == candidate_speaker
+
+    @classmethod
+    def _neighbor_fit_score(cls, query_profile: dict[str, Any], metadata: dict[str, Any]) -> float:
+        topic_tokens = set(query_profile.get("topic_tokens") or [])
+        passage_tokens = cls._rerank_tokens(str(metadata.get("evidence_text") or ""))
+        if not topic_tokens:
+            return 0.0
+        return len(topic_tokens & passage_tokens) / max(len(topic_tokens), 1)
+
+    @staticmethod
+    def _metadata_int(value: Any) -> int | None:
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return None
 
     def _query_temporal_intent(self, query: str) -> dict[str, Any]:
         cache_key = query.strip().lower()
@@ -1029,6 +1264,8 @@ class LinearRAGMemoryService:
             "i", "me", "my", "mine", "we", "our", "ours", "you", "your", "yours", "user",
             "answer", "answers", "best", "match", "matches", "memory", "option", "first", "second",
             "third", "fourth", "following", "about", "tell", "ask", "asked", "said", "say",
+            "would", "could", "should", "likely", "maybe", "probably", "possibly", "please",
+            "best", "matches", "match", "memory",
         }
         tokens = set()
         for token in re.findall(r"[a-z0-9][a-z0-9'_-]*", text.lower()):
@@ -1050,6 +1287,19 @@ class LinearRAGMemoryService:
         }
         if token in preference_tokens:
             return preference_tokens[token]
+        aliases = {
+            "edu": "education",
+            "counseling": "counsel",
+            "counselor": "counsel",
+            "counsellor": "counsel",
+            "counselling": "counsel",
+            "researched": "research",
+            "researching": "research",
+            "transitioning": "transition",
+            "transitioned": "transition",
+        }
+        if token in aliases:
+            return aliases[token]
         if len(token) > 4 and token.endswith("ing"):
             base = token[:-3]
             if len(base) > 2 and base[-1] == base[-2]:
@@ -1115,6 +1365,16 @@ class LinearRAGMemoryService:
                     values.append(value)
         return values
 
+    @staticmethod
+    def _has_relative_time_expression(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:today|yesterday|tomorrow|tonight|last week|next week|last month|next month|last year|next year|recently|currently|now|before|previously|earlier|later|this month|this week)\b",
+                str(text or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+
     @classmethod
     def _has_time_expression(cls, text: str) -> bool:
         return bool(cls._time_values(text))
@@ -1123,6 +1383,48 @@ class LinearRAGMemoryService:
     def _is_temporal_query(query: str) -> bool:
         lowered = query.lower()
         return any(token in lowered for token in ("when", "date", "day", "month", "year", "time", "before", "after", "earlier", "later"))
+
+    @classmethod
+    def _passage_metadata(cls, passage: str) -> dict[str, Any]:
+        visible = cls._strip_internal_prefix(passage)
+        metadata = {
+            "dia_id": cls._bracket_value(visible, "dia_id"),
+            "session_index": cls._bracket_value(visible, "session_index"),
+            "message_index": cls._bracket_value(visible, "message_index"),
+            "session_time": cls._bracket_value(visible, "session_time"),
+            "speaker": "",
+            "evidence_text": "",
+        }
+        speaker = ""
+        evidence_lines: list[str] = []
+        for line in visible.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            match = re.match(r"^([A-Z][A-Za-z0-9 ._'-]{0,60}):\s*(.*)$", stripped)
+            if match:
+                if not speaker:
+                    speaker = match.group(1).strip()
+                stripped = match.group(2).strip()
+            stripped = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", stripped).strip()
+            if not stripped or re.fullmatch(r"(?:\[[^\]]+\]\s*)+", stripped):
+                continue
+            evidence_lines.append(stripped)
+        metadata["speaker"] = speaker
+        metadata["evidence_text"] = "\n".join(evidence_lines).strip() or visible
+        return metadata
+
+    @staticmethod
+    def _bracket_value(text: str, name: str) -> str:
+        match = re.search(rf"\[{re.escape(name)}=([^\]]+)\]", str(text or ""))
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _normalize_person_name(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        text = re.sub(r"'s$", "", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
     def _strip_internal_prefix(passage: str) -> str:
