@@ -113,6 +113,10 @@ class LinearRAGMemoryService:
         self.structured_score_threshold = float(os.getenv("LINEARRAG_STRUCTURED_SCORE_THRESHOLD", "0.2"))
         self.rerank_candidate_multiplier = int(os.getenv("LINEARRAG_RERANK_CANDIDATE_MULTIPLIER", "3"))
         self.rerank_max_candidates = int(os.getenv("LINEARRAG_RERANK_MAX_CANDIDATES", "300"))
+        self.enable_search_debug = self._env_bool("LINEARRAG_ENABLE_SEARCH_DEBUG", False)
+        self.search_debug_path = Path(
+            os.getenv("LINEARRAG_SEARCH_DEBUG_PATH", str(self.root / "search_debug.jsonl"))
+        ).resolve()
 
         self.users_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -427,6 +431,7 @@ class LinearRAGMemoryService:
             if raw_id and raw_id in raw_temporal_profiles:
                 passage_profiles[passage] = raw_temporal_profiles[raw_id]
         temporal_context = self._temporal_context(passage_profiles.values())
+        anchor_context = self._anchor_temporal_context(temporal_intent, ranked, passage_profiles)
 
         adjusted = []
         for passage, score in ranked:
@@ -444,9 +449,21 @@ class LinearRAGMemoryService:
                     temporal_intent,
                     temporal_profile,
                     temporal_context,
+                    anchor_context,
                 )
             adjusted.append((passage, adjusted_score))
         adjusted.sort(key=lambda item: item[1], reverse=True)
+        self._write_search_debug(
+            user_key,
+            query,
+            options,
+            temporal_intent,
+            ranked,
+            adjusted,
+            passage_profiles,
+            temporal_context,
+            anchor_context,
+        )
         return adjusted
 
     def _evidence_rerank_factor(
@@ -457,6 +474,7 @@ class LinearRAGMemoryService:
         temporal_intent: dict[str, Any] | None = None,
         temporal_profile: dict[str, Any] | None = None,
         temporal_context: dict[str, float] | None = None,
+        anchor_context: dict[str, Any] | None = None,
     ) -> float:
         content = self._strip_internal_prefix(passage)
         content_lower = content.lower()
@@ -482,8 +500,14 @@ class LinearRAGMemoryService:
             factor += 0.05
 
         factor += self._best_option_match(options, passage_tokens, content_lower)
-        factor *= self._temporal_rerank_factor(temporal_intent or {}, temporal_profile or {}, temporal_context or {})
-        return max(0.70, min(1.90, factor))
+        factor *= self._target_rerank_factor(temporal_intent or {}, passage_tokens, content_lower)
+        factor *= self._temporal_rerank_factor(
+            temporal_intent or {},
+            temporal_profile or {},
+            temporal_context or {},
+            anchor_context or {},
+        )
+        return max(0.65, min(2.05, factor))
 
     def _query_temporal_intent(self, query: str) -> dict[str, Any]:
         cache_key = query.strip().lower()
@@ -632,6 +656,7 @@ class LinearRAGMemoryService:
         temporal_intent: dict[str, Any],
         profile: dict[str, Any],
         temporal_context: dict[str, float],
+        anchor_context: dict[str, Any] | None = None,
     ) -> float:
         intent = str(temporal_intent.get("temporal_intent") or "neutral")
         if intent == "neutral":
@@ -639,6 +664,7 @@ class LinearRAGMemoryService:
         cues = set(profile.get("temporal_cues") or [])
         kinds = set(profile.get("time_kinds") or [])
         has_time = bool(profile.get("has_explicit_time"))
+        confidence = max(0.0, min(1.0, float(temporal_intent.get("confidence") or 0.0)))
         factor = 1.0
 
         if intent == "when_exact":
@@ -666,13 +692,31 @@ class LinearRAGMemoryService:
             if "current_signal" in cues:
                 factor -= 0.06
         elif intent == "sequence_before":
-            factor += 0.08 * (1.0 - LinearRAGMemoryService._candidate_recency(profile, temporal_context))
+            anchor_factor = LinearRAGMemoryService._anchor_sequence_factor(
+                profile,
+                temporal_context,
+                anchor_context or {},
+                direction="before",
+                confidence=confidence,
+            )
+            factor *= anchor_factor
+            if not anchor_context:
+                factor += 0.08 * (1.0 - LinearRAGMemoryService._candidate_recency(profile, temporal_context))
             if cues & {"sequence_before", "history_signal"}:
                 factor += 0.08
             if "current_signal" in cues:
                 factor -= 0.05
         elif intent == "sequence_after":
-            factor += 0.08 * LinearRAGMemoryService._candidate_recency(profile, temporal_context)
+            anchor_factor = LinearRAGMemoryService._anchor_sequence_factor(
+                profile,
+                temporal_context,
+                anchor_context or {},
+                direction="after",
+                confidence=confidence,
+            )
+            factor *= anchor_factor
+            if not anchor_context:
+                factor += 0.08 * LinearRAGMemoryService._candidate_recency(profile, temporal_context)
             if cues & {"sequence_after", "current_signal"}:
                 factor += 0.08
         elif intent == "recent":
@@ -682,18 +726,180 @@ class LinearRAGMemoryService:
             if "history_signal" in cues:
                 factor -= 0.05
 
-        return max(0.85, min(1.28, factor))
+        return max(0.78, min(1.42, factor))
+
+    @classmethod
+    def _target_rerank_factor(
+        cls,
+        temporal_intent: dict[str, Any],
+        passage_tokens: set[str],
+        content_lower: str,
+    ) -> float:
+        factor = 1.0
+        target = str(temporal_intent.get("target") or "").strip()
+        if target:
+            target_tokens = cls._rerank_tokens(target)
+            if target_tokens and passage_tokens:
+                overlap = len(target_tokens & passage_tokens)
+                coverage = overlap / max(len(target_tokens), 1)
+                factor += min(0.20, 0.045 * overlap + 0.12 * coverage)
+            target_phrase = target.lower()
+            if len(target_phrase) > 4 and target_phrase in content_lower:
+                factor += 0.08
+
+        anchor_event = str(temporal_intent.get("anchor_event") or "").strip()
+        intent = str(temporal_intent.get("temporal_intent") or "")
+        if anchor_event and intent not in {"sequence_before", "sequence_after"}:
+            anchor_tokens = cls._rerank_tokens(anchor_event)
+            if anchor_tokens and passage_tokens:
+                overlap = len(anchor_tokens & passage_tokens)
+                coverage = overlap / max(len(anchor_tokens), 1)
+                factor += min(0.12, 0.035 * overlap + 0.06 * coverage)
+
+        return max(0.90, min(1.32, factor))
+
+    @classmethod
+    def _anchor_temporal_context(
+        cls,
+        temporal_intent: dict[str, Any],
+        ranked: list[tuple[str, float]],
+        passage_profiles: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        intent = str(temporal_intent.get("temporal_intent") or "")
+        if intent not in {"sequence_before", "sequence_after"}:
+            return {}
+        anchor_event = str(temporal_intent.get("anchor_event") or "").strip()
+        if not anchor_event:
+            return {}
+
+        anchor_tokens = cls._rerank_tokens(anchor_event)
+        if not anchor_tokens:
+            return {}
+
+        best: dict[str, Any] = {}
+        best_score = 0.0
+        for rank, (passage, base_score) in enumerate(ranked):
+            profile = passage_profiles.get(passage) or {}
+            value = cls._profile_time_value(profile)
+            if not value:
+                continue
+            content = cls._strip_internal_prefix(passage).lower()
+            passage_tokens = cls._rerank_tokens(content)
+            if not passage_tokens:
+                continue
+            overlap = len(anchor_tokens & passage_tokens)
+            coverage = overlap / max(len(anchor_tokens), 1)
+            score = 0.0
+            if overlap:
+                score += 0.45 * overlap + 0.80 * coverage
+            anchor_phrase = anchor_event.lower()
+            if len(anchor_phrase) > 4 and anchor_phrase in content:
+                score += 1.0
+            score += min(0.25, max(float(base_score), 0.0) * 0.05)
+            score -= min(0.20, rank * 0.01)
+            if score > best_score:
+                best_score = score
+                best = {
+                    "anchor_value": value,
+                    "anchor_raw_id": MemoryLayer.parse_raw_id(passage) or "",
+                    "anchor_score": score,
+                    "anchor_event": anchor_event,
+                    "direction": "before" if intent == "sequence_before" else "after",
+                }
+        return best if best_score >= 0.55 else {}
 
     @staticmethod
-    def _candidate_recency(profile: dict[str, Any], temporal_context: dict[str, float]) -> float:
+    def _anchor_sequence_factor(
+        profile: dict[str, Any],
+        temporal_context: dict[str, float],
+        anchor_context: dict[str, Any],
+        direction: str,
+        confidence: float,
+    ) -> float:
+        anchor_value = float(anchor_context.get("anchor_value") or 0.0)
+        value = LinearRAGMemoryService._profile_time_value(profile)
+        if not anchor_value or not value:
+            return 1.0
+        if value == anchor_value:
+            return 0.86
+
+        side_matches = value < anchor_value if direction == "before" else value > anchor_value
+        low = float(temporal_context.get("min") or 0.0)
+        high = float(temporal_context.get("max") or 0.0)
+        span = max(1.0, high - low)
+        distance = min(1.0, abs(value - anchor_value) / span)
+        strength = 0.12 + 0.16 * confidence
+        if side_matches:
+            return 1.0 + strength * (0.65 + 0.35 * distance)
+        return 1.0 - min(0.24, strength * (0.75 + 0.25 * distance))
+
+    @staticmethod
+    def _profile_time_value(profile: dict[str, Any]) -> float:
         value = MemoryLayer._time_value(profile.get("message_timestamp"))
         if not value:
             value = MemoryLayer._time_value(profile.get("order_index"))
+        return value
+
+    @staticmethod
+    def _candidate_recency(profile: dict[str, Any], temporal_context: dict[str, float]) -> float:
+        value = LinearRAGMemoryService._profile_time_value(profile)
         low = float(temporal_context.get("min") or 0.0)
         high = float(temporal_context.get("max") or 0.0)
         if not value or high <= low:
             return 0.5
         return max(0.0, min(1.0, (value - low) / (high - low)))
+
+    def _write_search_debug(
+        self,
+        user_key: str,
+        query: str,
+        options: list[str],
+        temporal_intent: dict[str, Any],
+        ranked: list[tuple[str, float]],
+        adjusted: list[tuple[str, float]],
+        passage_profiles: dict[str, dict[str, Any]],
+        temporal_context: dict[str, float],
+        anchor_context: dict[str, Any],
+    ) -> None:
+        if not self.enable_search_debug:
+            return
+        try:
+            before_rank = {passage: index for index, (passage, _) in enumerate(ranked, start=1)}
+            score_by_passage = {passage: score for passage, score in ranked}
+            rows = []
+            for index, (passage, adjusted_score) in enumerate(adjusted[:30], start=1):
+                raw_id = MemoryLayer.parse_raw_id(passage) or ""
+                profile = passage_profiles.get(passage) or {}
+                rows.append(
+                    {
+                        "rank_after": index,
+                        "rank_before": before_rank.get(passage),
+                        "raw_id": raw_id,
+                        "base_score": score_by_passage.get(passage),
+                        "adjusted_score": adjusted_score,
+                        "temporal_profile": profile,
+                        "content_preview": self._strip_internal_prefix(passage)[:240],
+                    }
+                )
+            self.search_debug_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.search_debug_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "user_key": user_key,
+                            "query": query,
+                            "options": options,
+                            "temporal_intent": temporal_intent,
+                            "temporal_context": temporal_context,
+                            "anchor_context": anchor_context,
+                            "candidates": rows,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            return
 
     @classmethod
     def _rerank_tokens(cls, text: str) -> set[str]:
@@ -716,6 +922,15 @@ class LinearRAGMemoryService:
     def _normalize_rerank_token(token: str) -> str:
         if len(token) > 5 and token.endswith("ies"):
             return token[:-3] + "y"
+        preference_tokens = {
+            "preference": "prefer",
+            "preferences": "prefer",
+            "preferred": "prefer",
+            "prefers": "prefer",
+            "preferring": "prefer",
+        }
+        if token in preference_tokens:
+            return preference_tokens[token]
         if len(token) > 4 and token.endswith("ing"):
             base = token[:-3]
             if len(base) > 2 and base[-1] == base[-2]:
