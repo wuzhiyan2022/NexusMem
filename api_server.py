@@ -407,7 +407,17 @@ class LinearRAGMemoryService:
 
     @staticmethod
     def _strip_internal_prefix(passage: str) -> str:
-        return re.sub(r"^\d+:", "", passage, count=1).lstrip()
+        text = re.sub(r"^\d+:", "", passage, count=1).lstrip()
+        lines = text.splitlines()
+        if not lines:
+            return text.strip()
+
+        first_line = lines[0].strip()
+        if re.fullmatch(r"(?:\[[^\]]+\]\s*)+", first_line):
+            return "\n".join(lines[1:]).strip()
+
+        text = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", text).lstrip()
+        return text.strip()
 
 
 service: LinearRAGMemoryService | None = None

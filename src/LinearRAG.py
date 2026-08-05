@@ -534,7 +534,9 @@ class LinearRAG:
             total_entity_bonus = 0
             passage_hash_id = self.passage_embedding_store.hash_ids[dpr_passage_index]
             dpr_passage_score = dpr_passage_scores[i]
-            passage_text_lower = self.passage_embedding_store.hash_id_to_text[passage_hash_id].lower()
+            passage_text_lower = self._visible_passage_text(
+                self.passage_embedding_store.hash_id_to_text[passage_hash_id]
+            ).lower()
             for entity_hash_id, (entity_id, entity_score, tier) in actived_entities.items():
                 entity_lower = self.entity_embedding_store.hash_id_to_text[entity_hash_id].lower()
                 entity_occurrences = passage_text_lower.count(entity_lower)
@@ -738,7 +740,10 @@ class LinearRAG:
         existing_passage_hash_id_to_entities,existing_sentence_to_entities, new_passage_hash_ids = self.load_existing_data(hash_id_to_passage.keys())
         if len(new_passage_hash_ids) > 0:
             new_hash_id_to_passage = {k : hash_id_to_passage[k] for k in new_passage_hash_ids}
-            new_passage_hash_id_to_entities,new_sentence_to_entities = self.spacy_ner.batch_ner(new_hash_id_to_passage, self.config.max_workers)
+            new_hash_id_to_ner_text = {
+                k: self._visible_passage_text(v) for k, v in new_hash_id_to_passage.items()
+            }
+            new_passage_hash_id_to_entities,new_sentence_to_entities = self.spacy_ner.batch_ner(new_hash_id_to_ner_text, self.config.max_workers)
             self.merge_ner_results(existing_passage_hash_id_to_entities, existing_sentence_to_entities, new_passage_hash_id_to_entities, new_sentence_to_entities)
         self.save_ner_results(existing_passage_hash_id_to_entities, existing_sentence_to_entities)
         entity_nodes, sentence_nodes,passage_hash_id_to_entities,self.entity_to_sentence,self.sentence_to_entity = self.extract_nodes_and_edges(existing_passage_hash_id_to_entities, existing_sentence_to_entities)
@@ -904,6 +909,20 @@ class LinearRAG:
         return raw_to_passages
 
     @staticmethod
+    def _visible_passage_text(passage):
+        text = re.sub(r"^\d+:", "", str(passage), count=1).lstrip()
+        lines = text.splitlines()
+        if not lines:
+            return text.strip()
+
+        first_line = lines[0].strip()
+        if re.fullmatch(r"(?:\[[^\]]+\]\s*)+", first_line):
+            return "\n".join(lines[1:]).strip()
+
+        text = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", text).lstrip()
+        return text.strip()
+
+    @staticmethod
     def _is_message_timestamp_time(time_node):
         expression = str(time_node.get("expression") or "")
         source = str(time_node.get("source") or "")
@@ -1027,7 +1046,7 @@ class LinearRAG:
         passage_to_entity_count ={} 
         passage_to_all_score = defaultdict(int)
         for passage_hash_id, entities in passage_hash_id_to_entities.items():
-            passage = self.passage_embedding_store.hash_id_to_text[passage_hash_id]
+            passage = self._visible_passage_text(self.passage_embedding_store.hash_id_to_text[passage_hash_id])
             for entity in entities:
                 entity_hash_id = self.entity_embedding_store.text_to_hash_id[entity]
                 count = passage.count(entity)

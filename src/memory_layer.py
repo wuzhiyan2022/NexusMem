@@ -225,37 +225,16 @@ class MemoryLayer:
         self._merge_json_list(self.time_nodes_path, time_nodes, "time_id")
         self._append_jsonl(self.graph_edges_path, graph_edges)
 
-        raw_to_memories = self._raw_to_memory_summary(consolidated)
         passages: list[str] = []
         seq = start_seq
         for raw in raw_records:
-            summary = raw_to_memories.get(raw["raw_id"], {})
             header_parts = [
-                "[view=raw_evidence]",
                 f"[raw_id={raw['raw_id']}]",
-                f"[session_id={raw['session_id']}]",
-                f"[request_id={raw['request_id']}]",
-                f"[message_index={raw['message_index']}]",
-                f"[part_index={raw['part_index']}]",
-                f"[role={raw['role']}]",
             ]
-            if raw.get("speaker"):
-                header_parts.append(f"[speaker={raw['speaker']}]")
-            if raw["timestamp"]:
-                header_parts.append(f"[timestamp={raw['timestamp']}]")
-            if summary.get("memory_ids"):
-                header_parts.append(f"[memory_ids={','.join(summary['memory_ids'])}]")
-            if summary.get("memory_types"):
-                header_parts.append(f"[memory_types={','.join(summary['memory_types'])}]")
-            if summary.get("event_times"):
-                header_parts.append(f"[event_times={','.join(summary['event_times'])}]")
-            if summary.get("event_ids"):
-                header_parts.append(f"[event_ids={','.join(summary['event_ids'])}]")
-            if summary.get("time_ids"):
-                header_parts.append(f"[time_ids={','.join(summary['time_ids'])}]")
 
             header = " ".join(header_parts)
-            passages.append(f"{seq}:{header}\n{raw['role']}: {raw['content']}")
+            speaker = raw.get("speaker") or raw["role"]
+            passages.append(f"{seq}:{header}\n{speaker}: {raw['content']}")
             seq += 1
         return passages
 
