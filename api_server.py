@@ -92,6 +92,7 @@ class LinearRAGMemoryService:
         self.enable_attribute_fallback = self._env_bool("LINEARRAG_ENABLE_ATTRIBUTE_FALLBACK", True)
         self.enable_memory_layer = self._env_bool("LINEARRAG_ENABLE_MEMORY_LAYER", True)
         self.enable_status_rerank = self._env_bool("LINEARRAG_ENABLE_STATUS_RERANK", True)
+        self.enable_evidence_rerank = self._env_bool("LINEARRAG_ENABLE_EVIDENCE_RERANK", True)
         self.enable_structured_memory_graph = self._env_bool("LINEARRAG_ENABLE_STRUCTURED_MEMORY_GRAPH", True)
         self.structured_node_top_k = int(os.getenv("LINEARRAG_STRUCTURED_NODE_TOP_K", "24"))
         self.structured_node_weight = float(os.getenv("LINEARRAG_STRUCTURED_NODE_WEIGHT", "0.35"))
@@ -165,7 +166,7 @@ class LinearRAGMemoryService:
             if limit == 0:
                 return {"data": []}
 
-            query = self._query_text(request)
+            query = request.query.strip()
             retrieve_limit = self._retrieve_limit(limit)
             rag.config.retrieval_top_k = retrieve_limit
             results = rag.retrieve([{"question": query, "answer": ""}])[0]
@@ -177,7 +178,7 @@ class LinearRAGMemoryService:
 
             data = []
             seen_ids: set[str] = set()
-            ranked_results = self._rank_search_results(user_key, query, passages, scores)
+            ranked_results = self._rank_search_results(user_key, query, request.options or [], passages, scores)
             for passage, score in ranked_results:
                 memory_id = rag.passage_embedding_store.text_to_hash_id.get(passage)
                 if memory_id is None:
@@ -374,7 +375,8 @@ class LinearRAGMemoryService:
         return query
 
     def _retrieve_limit(self, limit: int) -> int:
-        if not (self.enable_memory_layer and self.enable_status_rerank):
+        has_status_rerank = self.enable_memory_layer and self.enable_status_rerank
+        if not (has_status_rerank or self.enable_evidence_rerank):
             return limit
         multiplier = max(1, self.rerank_candidate_multiplier)
         max_candidates = max(limit, self.rerank_max_candidates)
@@ -384,26 +386,157 @@ class LinearRAGMemoryService:
         self,
         user_key: str,
         query: str,
+        options: list[str],
         passages: list[str],
         scores: list[float],
     ) -> list[tuple[str, float]]:
         ranked = [(passage, float(score)) for passage, score in zip(passages, scores)]
-        if not (self.enable_memory_layer and self.enable_status_rerank):
+        if not ranked:
             return ranked
 
-        try:
-            layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
-            raw_status = layer.load_raw_memory_status()
-            intent = MemoryLayer.query_intent(query)
-            adjusted = []
-            for passage, score in ranked:
+        raw_status: dict[str, Any] = {}
+        intent = MemoryLayer.query_intent(query)
+        if self.enable_memory_layer and self.enable_status_rerank:
+            try:
+                layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
+                raw_status = layer.load_raw_memory_status()
+            except Exception:
+                raw_status = {}
+
+        adjusted = []
+        for passage, score in ranked:
+            adjusted_score = score
+            if raw_status:
                 raw_id = MemoryLayer.parse_raw_id(passage)
                 status_info = raw_status.get(raw_id) if raw_id else None
-                adjusted.append((passage, MemoryLayer.adjust_score(score, status_info, intent)))
-            adjusted.sort(key=lambda item: item[1], reverse=True)
-            return adjusted
-        except Exception:
-            return ranked
+                adjusted_score = MemoryLayer.adjust_score(adjusted_score, status_info, intent)
+            if self.enable_evidence_rerank:
+                adjusted_score *= self._evidence_rerank_factor(query, options, passage)
+            adjusted.append((passage, adjusted_score))
+        adjusted.sort(key=lambda item: item[1], reverse=True)
+        return adjusted
+
+    def _evidence_rerank_factor(self, query: str, options: list[str], passage: str) -> float:
+        content = self._strip_internal_prefix(passage)
+        content_lower = content.lower()
+        query_tokens = self._rerank_tokens(query)
+        passage_tokens = self._rerank_tokens(content)
+        factor = 1.0
+
+        if query_tokens and passage_tokens:
+            overlap = len(query_tokens & passage_tokens)
+            coverage = overlap / max(len(query_tokens), 1)
+            factor += min(0.20, 0.025 * overlap)
+            factor += min(0.15, 0.12 * coverage)
+
+        phrase_hits = sum(1 for phrase in self._important_phrases(query) if phrase in content_lower)
+        if phrase_hits:
+            factor += min(0.12, 0.04 * phrase_hits)
+
+        query_times = self._time_values(query)
+        if query_times:
+            exact_time_hits = sum(1 for value in query_times if value in content_lower)
+            factor += min(0.18, 0.08 * exact_time_hits)
+        if self._is_temporal_query(query) and self._has_time_expression(content):
+            factor += 0.05
+
+        factor += self._best_option_match(options, passage_tokens, content_lower)
+        return max(0.75, min(1.75, factor))
+
+    @classmethod
+    def _rerank_tokens(cls, text: str) -> set[str]:
+        stopwords = {
+            "the", "and", "for", "with", "which", "what", "when", "where", "who", "why", "how",
+            "did", "does", "do", "was", "were", "is", "are", "am", "be", "been", "being",
+            "to", "of", "in", "on", "at", "by", "from", "as", "a", "an", "or", "if", "then",
+            "i", "me", "my", "mine", "we", "our", "ours", "you", "your", "yours", "user",
+            "answer", "answers", "best", "match", "matches", "memory", "option", "first", "second",
+            "third", "fourth", "following", "about", "tell", "ask", "asked", "said", "say",
+        }
+        tokens = set()
+        for token in re.findall(r"[a-z0-9][a-z0-9'_-]*", text.lower()):
+            normalized = cls._normalize_rerank_token(token.strip("'_-"))
+            if len(normalized) > 2 and normalized not in stopwords:
+                tokens.add(normalized)
+        return tokens
+
+    @staticmethod
+    def _normalize_rerank_token(token: str) -> str:
+        if len(token) > 5 and token.endswith("ies"):
+            return token[:-3] + "y"
+        if len(token) > 4 and token.endswith("ing"):
+            base = token[:-3]
+            if len(base) > 2 and base[-1] == base[-2]:
+                base = base[:-1]
+            return base
+        if len(token) > 4 and token.endswith("ed"):
+            base = token[:-2]
+            if base.endswith("v"):
+                base += "e"
+            if len(base) > 2 and base[-1] == base[-2]:
+                base = base[:-1]
+            return base
+        if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+            return token[:-1]
+        return token
+
+    @classmethod
+    def _important_phrases(cls, text: str) -> list[str]:
+        phrases = []
+        for phrase in re.findall(r"\b[A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*){0,3}\b", text):
+            normalized = phrase.lower().strip()
+            if len(normalized) > 2 and normalized not in {"which", "what", "when", "where", "who", "options"}:
+                phrases.append(normalized)
+        return phrases
+
+    @classmethod
+    def _best_option_match(cls, options: list[str], passage_tokens: set[str], content_lower: str) -> float:
+        best = 0.0
+        for option in options or []:
+            option_text = cls._strip_option_label(str(option))
+            option_tokens = cls._rerank_tokens(option_text)
+            if not option_tokens:
+                continue
+            overlap = len(option_tokens & passage_tokens)
+            coverage = overlap / max(len(option_tokens), 1)
+            score = min(0.16, 0.04 * overlap + 0.08 * coverage)
+            option_lower = option_text.lower().strip()
+            if len(option_lower) > 3 and option_lower in content_lower:
+                score += 0.06
+            best = max(best, score)
+        return min(0.22, best)
+
+    @staticmethod
+    def _strip_option_label(option: str) -> str:
+        return re.sub(r"^\s*(?:[A-Z]|\d+)[\).:\-]\s*", "", option.strip())
+
+    @classmethod
+    def _time_values(cls, text: str) -> list[str]:
+        patterns = [
+            r"\b\d{4}-\d{1,2}-\d{1,2}\b",
+            r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
+            r"\b(?:19|20)\d{2}\b",
+            r"\b\d{1,2}:\d{2}(?:\s?[ap]\.?m\.?)?\b",
+            r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?\b",
+            r"\b(?:today|yesterday|tomorrow|tonight|last week|next week|last month|next month|last year|next year|recently|currently|now|before|previously|earlier|later)\b",
+        ]
+        values = []
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                value = str(match).strip().lower()
+                if value and value not in values:
+                    values.append(value)
+        return values
+
+    @classmethod
+    def _has_time_expression(cls, text: str) -> bool:
+        return bool(cls._time_values(text))
+
+    @staticmethod
+    def _is_temporal_query(query: str) -> bool:
+        lowered = query.lower()
+        return any(token in lowered for token in ("when", "date", "day", "month", "year", "time", "before", "after", "earlier", "later"))
 
     @staticmethod
     def _strip_internal_prefix(passage: str) -> str:
