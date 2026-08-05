@@ -98,11 +98,34 @@ class MemoryLayer:
     }
     CONFIDENCE_BASE_BY_SOURCE = {
         "exact_rule": 0.82,
+        "llm_memory": 0.84,
+        "llm_event": 0.82,
         "event_spacy": 0.74,
         "generic_spacy": 0.66,
         "generic_noun_chunk": 0.56,
         "observation": 0.30,
         "unknown": 0.45,
+    }
+    LLM_MIN_CONFIDENCE = 0.60
+    LLM_MIN_MEMORY_WORTHINESS = 0.65
+    LLM_MIN_EVENT_WORTHINESS = 0.65
+    LLM_MIN_TIME_CONFIDENCE = 0.55
+    LLM_MEMORY_TYPE_MAP = {
+        "preference": "preference",
+        "relationship": "relation",
+        "relation": "relation",
+        "profile": "fact",
+        "identity": "fact",
+        "fact": "fact",
+        "habit": "fact",
+        "constraint": "fact",
+        "goal": "fact",
+        "plan": "fact",
+        "state": "fact",
+        "location": "fact",
+        "work": "fact",
+        "education": "fact",
+        "experience": "fact",
     }
     SINGLE_VALUE_PREDICATES = {
         "current_location",
@@ -160,6 +183,7 @@ class MemoryLayer:
         split_sentences: Callable[[str], list[str]] | None = None,
         extract_events: Callable[[str], list[dict[str, Any]]] | None = None,
         extract_generic_memories: Callable[[str, str], list[dict[str, Any]]] | None = None,
+        extract_llm_structured: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> list[str]:
         self.user_dir.mkdir(parents=True, exist_ok=True)
         consolidated = self._load_consolidated()
@@ -196,6 +220,7 @@ class MemoryLayer:
                     split_sentences=split_sentences,
                     extract_events=extract_events,
                     extract_generic_memories=extract_generic_memories,
+                    extract_llm_structured=extract_llm_structured,
                     speaker=speaker,
                 )
                 raw_records.append(
@@ -345,23 +370,144 @@ class MemoryLayer:
         if lowered.startswith("our "):
             candidate["subject"] = f"{actor}'s {subject[4:].strip()}"
 
-    @staticmethod
-    def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen: set[tuple[str, str, str, str, str]] = set()
+    @classmethod
+    def _dedupe_candidates(cls, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         unique: list[dict[str, Any]] = []
         for candidate in candidates:
-            key = (
-                str(candidate.get("memory_type") or ""),
-                str(candidate.get("subject") or "").lower(),
-                str(candidate.get("predicate") or "").lower(),
-                str(candidate.get("object") or "").lower(),
-                str(candidate.get("polarity") or ""),
-            )
-            if key in seen:
+            duplicate_index = None
+            for index, existing in enumerate(unique):
+                if cls._is_duplicate_candidate(candidate, existing):
+                    duplicate_index = index
+                    break
+            if duplicate_index is None:
+                unique.append(candidate)
                 continue
-            seen.add(key)
-            unique.append(candidate)
+
+            existing = unique[duplicate_index]
+            if cls._candidate_dedupe_priority(candidate) > cls._candidate_dedupe_priority(existing):
+                unique[duplicate_index] = candidate
         return unique
+
+    @classmethod
+    def _suppress_shadowed_event_candidates(cls, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        has_llm_event = any(
+            candidate.get("memory_type") == "event" and candidate.get("pattern") == "llm_event"
+            for candidate in candidates
+        )
+        if not has_llm_event:
+            return candidates
+        return [
+            candidate
+            for candidate in candidates
+            if candidate.get("memory_type") != "event" or candidate.get("pattern") == "llm_event"
+        ]
+
+    @classmethod
+    def _filter_temporal_anchor_event_noise(
+        cls,
+        candidates: list[dict[str, Any]],
+        sentence: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            candidate
+            for candidate in candidates
+            if not cls._is_temporal_anchor_event_noise(candidate, sentence)
+        ]
+
+    @classmethod
+    def _is_temporal_anchor_event_noise(cls, candidate: dict[str, Any], sentence: str) -> bool:
+        if candidate.get("memory_type") != "event" or str(candidate.get("pattern") or "").startswith("llm_"):
+            return False
+        predicate = cls._normalize_value(candidate.get("predicate", ""))
+        if predicate not in {"start", "begin", "finish", "complete", "end"}:
+            return False
+        object_text = cls._normalize_value(candidate.get("object", ""))
+        if not object_text:
+            return False
+        object_pattern = re.escape(object_text).replace(r"\ ", r"\s+")
+        return bool(
+            re.search(
+                rf"\b(?:after|before|during|since|until|following|prior\s+to)\b[^.!?]*\b{object_pattern}\b",
+                sentence,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _is_duplicate_candidate(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_type = str(left.get("memory_type") or "")
+        right_type = str(right.get("memory_type") or "")
+        if left_type != right_type:
+            return False
+
+        left_subject = cls._normalize_value(left.get("subject", ""))
+        right_subject = cls._normalize_value(right.get("subject", ""))
+        if left_subject != right_subject:
+            return False
+
+        left_predicate = cls._normalize_value(left.get("predicate", ""))
+        right_predicate = cls._normalize_value(right.get("predicate", ""))
+        left_object = cls._normalize_value(left.get("object", ""))
+        right_object = cls._normalize_value(right.get("object", ""))
+        left_polarity = str(left.get("polarity") or "")
+        right_polarity = str(right.get("polarity") or "")
+
+        if (
+            left_predicate == right_predicate
+            and left_object == right_object
+            and left_polarity == right_polarity
+        ):
+            return True
+
+        object_overlap = cls._token_overlap(left_object, right_object)
+        predicate_overlap = cls._token_overlap(left_predicate, right_predicate)
+        if left_type == "event":
+            if object_overlap >= 0.55 and (predicate_overlap > 0 or left_predicate in right_predicate or right_predicate in left_predicate):
+                return True
+            return bool(left_object and right_object and (left_object in right_object or right_object in left_object) and object_overlap >= 0.45)
+
+        if left_type == "preference" and left_polarity == right_polarity:
+            return object_overlap >= 0.65
+
+        return object_overlap >= 0.72 and (
+            left_predicate == right_predicate
+            or predicate_overlap >= 0.5
+            or left_predicate in right_predicate
+            or right_predicate in left_predicate
+        )
+
+    @staticmethod
+    def _candidate_dedupe_priority(candidate: dict[str, Any]) -> float:
+        pattern = str(candidate.get("pattern") or "")
+        priority_by_pattern = {
+            "llm_event": 100.0,
+            "llm_memory": 96.0,
+            "preference": 82.0,
+            "fact": 80.0,
+            "relation": 80.0,
+            "event": 72.0,
+            "event_spacy_verb": 68.0,
+            "generic_spacy_noun_chunk": 58.0,
+            "generic_spacy_observation": 25.0,
+        }
+        if pattern.startswith("generic_spacy_"):
+            base = 62.0
+        else:
+            base = priority_by_pattern.get(pattern, 45.0)
+        confidence = MemoryLayer._safe_float(candidate.get("llm_confidence"))
+        worthiness = max(
+            MemoryLayer._safe_float(candidate.get("event_worthiness")),
+            MemoryLayer._safe_float(candidate.get("memory_worthiness")),
+        )
+        return base + confidence * 5.0 + worthiness * 3.0
+
+    @staticmethod
+    def _token_overlap(left: str, right: str) -> float:
+        left_tokens = set(re.findall(r"[a-z0-9]+", str(left or "").lower()))
+        right_tokens = set(re.findall(r"[a-z0-9]+", str(right or "").lower()))
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / max(min(len(left_tokens), len(right_tokens)), 1)
 
     def _extract_candidates(
         self,
@@ -378,13 +524,34 @@ class MemoryLayer:
         split_sentences: Callable[[str], list[str]] | None = None,
         extract_events: Callable[[str], list[dict[str, Any]]] | None = None,
         extract_generic_memories: Callable[[str, str], list[dict[str, Any]]] | None = None,
+        extract_llm_structured: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
         speaker: str = "",
     ) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         sentence_splitter = split_sentences or self._split_sentences
         actor = self._actor_subject(speaker, role)
-        for sentence_index, sentence in enumerate(sentence_splitter(text)):
+        sentences = [sentence for sentence in sentence_splitter(text) if str(sentence or "").strip()]
+        llm_candidates_by_sentence: dict[int, list[dict[str, Any]]] = {}
+        if extract_llm_structured is not None and sentences:
+            llm_candidates_by_sentence = self._extract_llm_candidates_for_raw(
+                extract_llm_structured,
+                sentences,
+                raw_id=raw_id,
+                role=role,
+                speaker=speaker,
+                actor=actor,
+                timestamp=timestamp,
+                user_id=user_id,
+                session_id=session_id,
+                request_id=request_id,
+                message_index=message_index,
+                part_index=part_index,
+            )
+
+        for sentence_index, sentence in enumerate(sentences):
             sentence_candidates: list[dict[str, Any]] = []
+            llm_sentence_candidates = llm_candidates_by_sentence.get(sentence_index, [])
+            sentence_candidates.extend(llm_sentence_candidates)
             sentence_candidates.extend(self._preference_candidates(sentence))
             sentence_candidates.extend(self._fact_candidates(sentence))
             sentence_candidates.extend(self._relation_candidates(sentence))
@@ -396,7 +563,11 @@ class MemoryLayer:
             if extract_generic_memories is not None:
                 sentence_candidates.extend(extract_generic_memories(sentence, actor))
             sentence_candidates = self._dedupe_candidates(sentence_candidates)
+            sentence_candidates = self._suppress_shadowed_event_candidates(sentence_candidates)
+            sentence_candidates = self._filter_temporal_anchor_event_noise(sentence_candidates, sentence)
+            sentence_candidates = self._dedupe_candidates(sentence_candidates)
 
+            processed_sentence_candidates: list[dict[str, Any]] = []
             for candidate in sentence_candidates:
                 self._resolve_candidate_subject(candidate, actor)
                 time_expressions = self._extract_time_expressions(sentence, timestamp)
@@ -415,7 +586,7 @@ class MemoryLayer:
                         "role": role,
                         "timestamp": timestamp,
                         "time_expressions": time_expressions,
-                        "update_signal": self._has_update_signal(sentence),
+                        "update_signal": bool(candidate.get("update_signal")) or self._has_update_signal(sentence),
                     }
                 )
                 candidate["object_norm"] = self._normalize_value(candidate.get("object", ""))
@@ -426,10 +597,261 @@ class MemoryLayer:
                 ]
                 if candidate.get("memory_type") == "event":
                     candidate["event_id"] = self._event_id(candidate)
+                processed_sentence_candidates.append(candidate)
+
+            sentence_event_ids = [
+                candidate.get("event_id")
+                for candidate in processed_sentence_candidates
+                if candidate.get("memory_type") == "event" and candidate.get("event_id")
+            ]
+            if len(sentence_event_ids) == 1:
+                for candidate in processed_sentence_candidates:
+                    if candidate.get("pattern") == "llm_memory" and candidate.get("memory_type") != "event":
+                        candidate["event_id"] = sentence_event_ids[0]
+
+            for candidate in processed_sentence_candidates:
                 candidate["confidence"] = self._confidence(candidate)
                 candidate["candidate_id"] = self._candidate_id(candidate)
                 candidates.append(candidate)
         return candidates
+
+    def _extract_llm_candidates_for_raw(
+        self,
+        extract_llm_structured: Callable[[dict[str, Any]], dict[str, Any] | None],
+        sentences: list[str],
+        *,
+        raw_id: str,
+        role: str,
+        speaker: str,
+        actor: str,
+        timestamp: str,
+        user_id: str,
+        session_id: str,
+        request_id: str,
+        message_index: int,
+        part_index: int,
+    ) -> dict[int, list[dict[str, Any]]]:
+        payload = {
+            "raw_id": raw_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "request_id": request_id,
+            "message_index": message_index,
+            "part_index": part_index,
+            "role": role,
+            "speaker": speaker,
+            "actor": actor,
+            "message_timestamp": timestamp,
+            "sentences": [
+                {
+                    "sentence_id": f"{raw_id}:s{index}",
+                    "sentence_index": index,
+                    "text": sentence,
+                }
+                for index, sentence in enumerate(sentences)
+            ],
+        }
+        try:
+            result = extract_llm_structured(payload)
+        except Exception:
+            return {}
+        if not isinstance(result, dict):
+            return {}
+
+        times_by_sentence = self._llm_times_by_sentence(result, sentences)
+        candidates_by_sentence: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for item in result.get("events") or []:
+            candidate = self._llm_event_candidate(item, sentences, times_by_sentence)
+            if candidate is not None:
+                sentence_index = int(candidate.pop("_llm_sentence_index"))
+                candidates_by_sentence[sentence_index].append(candidate)
+        for item in result.get("memories") or []:
+            candidate = self._llm_memory_candidate(item, sentences, times_by_sentence)
+            if candidate is not None:
+                sentence_index = int(candidate.pop("_llm_sentence_index"))
+                candidates_by_sentence[sentence_index].append(candidate)
+        return dict(candidates_by_sentence)
+
+    def _llm_times_by_sentence(self, result: dict[str, Any], sentences: list[str]) -> dict[int, list[str]]:
+        times_by_sentence: dict[int, list[str]] = defaultdict(list)
+        for item in result.get("times") or []:
+            if not isinstance(item, dict):
+                continue
+            confidence = self._safe_float(item.get("confidence"))
+            if confidence < self.LLM_MIN_TIME_CONFIDENCE:
+                continue
+            sentence_index = self._llm_sentence_index(item, sentences)
+            if sentence_index is None:
+                continue
+            sentence = sentences[sentence_index]
+            evidence = str(item.get("evidence_text") or item.get("text") or "").strip()
+            if not self._evidence_in_text(evidence, sentence):
+                continue
+            text = str(item.get("text") or evidence).strip()
+            if text:
+                self._append_unique(times_by_sentence[sentence_index], text)
+        return dict(times_by_sentence)
+
+    def _llm_event_candidate(
+        self,
+        item: Any,
+        sentences: list[str],
+        times_by_sentence: dict[int, list[str]],
+    ) -> dict[str, Any] | None:
+        if not isinstance(item, dict) or not bool(item.get("is_event", True)):
+            return None
+        worthiness = self._safe_float(item.get("event_worthiness"))
+        confidence = self._safe_float(item.get("confidence"))
+        if worthiness < self.LLM_MIN_EVENT_WORTHINESS or confidence < self.LLM_MIN_CONFIDENCE:
+            return None
+        sentence_index = self._llm_sentence_index(item, sentences)
+        if sentence_index is None:
+            return None
+        sentence = sentences[sentence_index]
+        if "?" in sentence:
+            return None
+        evidence = str(item.get("evidence_text") or "").strip()
+        if not self._evidence_in_text(evidence, sentence):
+            return None
+        subject = str(item.get("subject") or "").strip()
+        trigger = str(item.get("trigger") or item.get("predicate") or "").strip()
+        object_text = self._clean_event_object(str(item.get("object") or "").strip())
+        if not subject or not trigger or not object_text:
+            return None
+        time_expressions = self._llm_item_times(item, times_by_sentence.get(sentence_index, []), sentence)
+        participants = item.get("participants") if isinstance(item.get("participants"), list) else []
+        participants = [str(value).strip() for value in participants if str(value or "").strip()]
+        for value in (subject, object_text):
+            self._append_unique(participants, value)
+        return (
+            self._candidate(
+                memory_type="event",
+                subject=subject,
+                predicate=self._canonical_event_trigger(trigger),
+                object_text=object_text,
+                polarity="neutral",
+                pattern="llm_event",
+            )
+            | {
+                "_llm_sentence_index": sentence_index,
+                "event_trigger": trigger.lower(),
+                "event_type": str(item.get("event_type") or "").strip(),
+                "event_participants": participants,
+                "time_expressions": time_expressions,
+                "llm_confidence": confidence,
+                "event_worthiness": worthiness,
+                "source_text": evidence,
+            }
+        )
+
+    def _llm_memory_candidate(
+        self,
+        item: Any,
+        sentences: list[str],
+        times_by_sentence: dict[int, list[str]],
+    ) -> dict[str, Any] | None:
+        if not isinstance(item, dict) or not bool(item.get("is_memory", True)):
+            return None
+        worthiness = self._safe_float(item.get("memory_worthiness"))
+        confidence = self._safe_float(item.get("confidence"))
+        if worthiness < self.LLM_MIN_MEMORY_WORTHINESS or confidence < self.LLM_MIN_CONFIDENCE:
+            return None
+        sentence_index = self._llm_sentence_index(item, sentences)
+        if sentence_index is None:
+            return None
+        sentence = sentences[sentence_index]
+        if "?" in sentence:
+            return None
+        evidence = str(item.get("evidence_text") or "").strip()
+        if not self._evidence_in_text(evidence, sentence):
+            return None
+        subject = str(item.get("subject") or "").strip()
+        predicate = str(item.get("predicate") or item.get("memory_type") or "").strip()
+        object_text = self._clean_object(str(item.get("object") or "").strip())
+        if not subject or not predicate or not object_text:
+            return None
+        memory_type = self._normalize_llm_memory_type(str(item.get("memory_type") or "fact"))
+        polarity = str(item.get("polarity") or "neutral").strip().lower()
+        if polarity not in {"positive", "negative", "neutral"}:
+            polarity = "neutral"
+        time_expressions = self._llm_item_times(item, times_by_sentence.get(sentence_index, []), sentence)
+        return (
+            self._candidate(
+                memory_type=memory_type,
+                subject=subject,
+                predicate=self._normalize_llm_predicate(predicate, memory_type),
+                object_text=object_text,
+                polarity=polarity,
+                pattern="llm_memory",
+            )
+            | {
+                "_llm_sentence_index": sentence_index,
+                "time_expressions": time_expressions,
+                "llm_confidence": confidence,
+                "memory_worthiness": worthiness,
+                "stability": str(item.get("stability") or "").strip(),
+                "update_signal": bool(item.get("update_signal")),
+                "source_text": evidence,
+            }
+        )
+
+    def _llm_item_times(self, item: dict[str, Any], sentence_times: list[str], sentence: str) -> list[str]:
+        values: list[str] = []
+        for value in sentence_times:
+            self._append_unique(values, value)
+        for value in item.get("time_expressions") or []:
+            text = str(value or "").strip()
+            if text and self._evidence_in_text(text, sentence):
+                self._append_unique(values, text)
+        return values
+
+    @classmethod
+    def _llm_sentence_index(cls, item: dict[str, Any], sentences: list[str]) -> int | None:
+        raw_index = item.get("sentence_index")
+        try:
+            index = int(raw_index)
+            if 0 <= index < len(sentences):
+                return index
+        except Exception:
+            pass
+        sentence_id = str(item.get("sentence_id") or "")
+        match = re.search(r":s(\d+)$", sentence_id)
+        if match:
+            index = int(match.group(1))
+            if 0 <= index < len(sentences):
+                return index
+        evidence = str(item.get("evidence_text") or item.get("text") or "").strip()
+        if evidence:
+            for index, sentence in enumerate(sentences):
+                if cls._evidence_in_text(evidence, sentence):
+                    return index
+        return None
+
+    @staticmethod
+    def _normalize_llm_memory_type(memory_type: str) -> str:
+        key = re.sub(r"[^a-z_]+", "_", str(memory_type or "").strip().lower()).strip("_")
+        return MemoryLayer.LLM_MEMORY_TYPE_MAP.get(key, "fact")
+
+    @staticmethod
+    def _normalize_llm_predicate(predicate: str, memory_type: str) -> str:
+        value = re.sub(r"\s+", "_", str(predicate or "").strip().lower())
+        value = re.sub(r"[^a-z0-9_:_-]+", "", value).strip("_")
+        if value:
+            return value
+        return "preference" if memory_type == "preference" else memory_type or "fact"
+
+    @staticmethod
+    def _evidence_in_text(evidence: str, text: str) -> bool:
+        evidence = re.sub(r"\s+", " ", str(evidence or "").strip())
+        text = re.sub(r"\s+", " ", str(text or "").strip())
+        return bool(evidence) and evidence.lower() in text.lower()
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 0.0
 
     def _preference_candidates(self, sentence: str) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
@@ -1145,8 +1567,9 @@ class MemoryLayer:
             "superseded_by": "",
             "conflicts_with": [],
         }
-        if candidate.get("memory_type") == "event":
+        if candidate.get("event_id"):
             memory["event_id"] = candidate.get("event_id")
+        if candidate.get("memory_type") == "event":
             memory["event_trigger"] = candidate.get("event_trigger")
             memory["event_participants"] = candidate.get("event_participants") or []
         return memory
@@ -1266,6 +1689,13 @@ class MemoryLayer:
             confidence_source,
             self.CONFIDENCE_BASE_BY_SOURCE["unknown"],
         )
+        llm_confidence = self._safe_float(candidate.get("llm_confidence"))
+        if confidence_source in {"llm_event", "llm_memory"} and llm_confidence:
+            worthiness = max(
+                self._safe_float(candidate.get("event_worthiness")),
+                self._safe_float(candidate.get("memory_worthiness")),
+            )
+            score = max(score, 0.52 + 0.28 * llm_confidence + 0.15 * worthiness)
         if candidate.get("object"):
             score += 0.04
         if candidate.get("time_expressions") or candidate.get("timestamp"):
@@ -1285,6 +1715,10 @@ class MemoryLayer:
         pattern = str(candidate.get("pattern") or "").lower()
         if memory_type == "observation" or pattern == "generic_spacy_observation":
             return "observation"
+        if pattern == "llm_event":
+            return "llm_event"
+        if pattern == "llm_memory":
+            return "llm_memory"
         if pattern == "generic_spacy_noun_chunk":
             return "generic_noun_chunk"
         if pattern.startswith("generic_spacy_"):
@@ -1532,6 +1966,7 @@ class MemoryLayer:
             if expression.startswith("message_timestamp:"):
                 continue
             text = re.sub(re.escape(expression), "", text, flags=re.IGNORECASE).strip()
+        text = re.split(r"\b(?:after|before|during|since|until|following|prior\s+to)\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
         text = re.sub(r"^(?:to|in|at|for|from|with|on|into|onto|about)\s+", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s+(?:to|in|at|for|from|with|on|into|onto|about)$", "", text, flags=re.IGNORECASE)
         text = re.sub(r"^(?:到|去|在|从|和|与|把)", "", text)

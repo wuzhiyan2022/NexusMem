@@ -104,6 +104,17 @@ class LinearRAGMemoryService:
             os.getenv("LINEARRAG_QUERY_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
         ).strip()
         self.query_llm_timeout = float(os.getenv("LINEARRAG_QUERY_LLM_TIMEOUT", "4"))
+        self.enable_llm_memory_extraction = self._env_bool("LINEARRAG_ENABLE_LLM_MEMORY_EXTRACTION", True)
+        self.extract_llm_model = os.getenv("LINEARRAG_EXTRACT_LLM_MODEL", self.query_llm_model).strip()
+        self.extract_llm_base_url = (
+            os.getenv("LINEARRAG_EXTRACT_LLM_BASE_URL") or self.query_llm_base_url
+        ).strip().rstrip("/")
+        self.extract_llm_api_key = (
+            os.getenv("LINEARRAG_EXTRACT_LLM_API_KEY") or self.query_llm_api_key
+        ).strip()
+        self.extract_llm_timeout = float(os.getenv("LINEARRAG_EXTRACT_LLM_TIMEOUT", "8"))
+        self.extract_llm_batch_size = int(os.getenv("LINEARRAG_EXTRACT_LLM_BATCH_SIZE", "8"))
+        self.extract_llm_max_tokens = int(os.getenv("LINEARRAG_EXTRACT_LLM_MAX_TOKENS", "1800"))
         self.enable_structured_memory_graph = self._env_bool("LINEARRAG_ENABLE_STRUCTURED_MEMORY_GRAPH", True)
         self.structured_node_top_k = int(os.getenv("LINEARRAG_STRUCTURED_NODE_TOP_K", "24"))
         self.structured_node_weight = float(os.getenv("LINEARRAG_STRUCTURED_NODE_WEIGHT", "0.35"))
@@ -257,6 +268,7 @@ class LinearRAGMemoryService:
             return self._build_passages(request, start_seq)
 
         layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
+        llm_extractor = self._extract_llm_structured_memory if self._llm_memory_extraction_ready() else None
         return layer.build_passages(
             request,
             self._split_content,
@@ -264,7 +276,114 @@ class LinearRAGMemoryService:
             self._split_sentences,
             self._extract_event_candidates,
             self._extract_generic_memory_candidates,
+            llm_extractor,
         )
+
+    def _llm_memory_extraction_ready(self) -> bool:
+        return bool(
+            self.enable_llm_memory_extraction
+            and self.extract_llm_model
+            and self.extract_llm_base_url
+            and self.extract_llm_api_key
+        )
+
+    def _extract_llm_structured_memory(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        sentences = payload.get("sentences") or []
+        if not isinstance(sentences, list) or not sentences:
+            return None
+
+        batch_size = max(1, self.extract_llm_batch_size)
+        if len(sentences) > batch_size:
+            merged: dict[str, list[Any]] = {"events": [], "memories": [], "times": [], "relations": []}
+            for start in range(0, len(sentences), batch_size):
+                batch_payload = dict(payload)
+                batch_payload["sentences"] = sentences[start : start + batch_size]
+                result = self._extract_llm_structured_memory_single(batch_payload)
+                if not isinstance(result, dict):
+                    continue
+                for key in merged:
+                    values = result.get(key) or []
+                    if isinstance(values, list):
+                        merged[key].extend(values)
+            return merged
+
+        return self._extract_llm_structured_memory_single(payload)
+
+    def _extract_llm_structured_memory_single(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        url = self._chat_completions_url(self.extract_llm_base_url)
+        system_prompt = (
+            "You are an information extraction module for a long-term memory retrieval system. "
+            "Extract only information explicitly supported by the input text. Return valid JSON only.\n\n"
+            "Definitions:\n"
+            "1. Event nodes: concrete actions, changes, decisions, experiences, or state transitions involving "
+            "the user or a named participant. Do not extract events for generic facts, greetings, questions, "
+            "instructions, vague future wishes, or simple preferences without action/change.\n"
+            "2. Memory nodes: durable information useful for future user-related questions, including preferences, "
+            "relationships, profile, habits, constraints, goals, stable states, important plans, and important "
+            "past experiences. Do not extract trivial chat, one-time commands, generic world knowledge, vague "
+            "speculation, or low-value duplicates.\n"
+            "3. Time nodes: time expressions present in text, including absolute dates, relative time, sequence "
+            "markers, duration, current-state cues, and history cues. Do not convert relative time to absolute "
+            "dates. message_timestamp is only ordering metadata, not semantic event time.\n\n"
+            "Every extracted item must include sentence_index, evidence_text, and confidence. evidence_text must "
+            "be an exact substring of the corresponding sentence. Use empty arrays if nothing qualifies.\n\n"
+            "Return this JSON schema exactly:\n"
+            "{"
+            "\"events\":[{\"sentence_index\":0,\"is_event\":true,\"event_worthiness\":0.0,"
+            "\"subject\":\"\",\"trigger\":\"\",\"object\":\"\",\"event_type\":\"\",\"participants\":[],"
+            "\"time_expressions\":[],\"evidence_text\":\"\",\"confidence\":0.0}],"
+            "\"memories\":[{\"sentence_index\":0,\"is_memory\":true,\"memory_worthiness\":0.0,"
+            "\"memory_type\":\"preference|relation|profile|fact|habit|constraint|goal|plan|state|location|work|education|experience\","
+            "\"subject\":\"\",\"predicate\":\"\",\"object\":\"\",\"polarity\":\"positive|negative|neutral\","
+            "\"stability\":\"current|history|stable|planned|unknown\",\"update_signal\":false,"
+            "\"time_expressions\":[],\"evidence_text\":\"\",\"confidence\":0.0}],"
+            "\"times\":[{\"sentence_index\":0,\"text\":\"\",\"time_type\":\"absolute_date|year|relative|sequence|duration|current|history|unknown\","
+            "\"temporal_role\":\"event_time|memory_time|sequence_marker|duration|current_marker|history_marker|unknown\","
+            "\"sequence_direction\":\"before|after|\",\"evidence_text\":\"\",\"confidence\":0.0}],"
+            "\"relations\":[]"
+            "}"
+        )
+        user_payload = {
+            "raw_id": payload.get("raw_id"),
+            "role": payload.get("role"),
+            "speaker": payload.get("speaker"),
+            "actor": payload.get("actor"),
+            "message_timestamp": payload.get("message_timestamp"),
+            "sentences": payload.get("sentences") or [],
+        }
+        request_payload = {
+            "model": self.extract_llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+            "temperature": 0,
+            "max_tokens": self.extract_llm_max_tokens,
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.extract_llm_api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.extract_llm_timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+            data = self._parse_json_object(content)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {
+            "events": data.get("events") if isinstance(data.get("events"), list) else [],
+            "memories": data.get("memories") if isinstance(data.get("memories"), list) else [],
+            "times": data.get("times") if isinstance(data.get("times"), list) else [],
+            "relations": data.get("relations") if isinstance(data.get("relations"), list) else [],
+        }
 
     def _build_passages(self, request: AddRequest, start_seq: int) -> list[str]:
         passages: list[str] = []

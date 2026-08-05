@@ -854,6 +854,8 @@ class LinearRAG:
             if not source_id or not target_id:
                 continue
             if edge_type == "evidence":
+                if self._is_time_structured_node(source_id, valid_time_ids):
+                    continue
                 for passage_id in raw_to_passages.get(target_id, []):
                     self._add_weighted_edge(source_id, passage_id, 1.0)
             elif edge_type == "occurs_at" and target_id in valid_time_ids:
@@ -872,6 +874,14 @@ class LinearRAG:
             return
         current = self.node_to_node_stats[source_id].get(target_id, 0.0)
         self.node_to_node_stats[source_id][target_id] = max(float(current), float(weight))
+
+    def _is_time_structured_node(self, node_id, valid_time_ids):
+        node_id = str(node_id or "")
+        if node_id in valid_time_ids:
+            return True
+        if self.structured_node_types.get(node_id) == "time":
+            return True
+        return node_id.startswith("time-")
 
     @staticmethod
     def _load_json_list(path):
