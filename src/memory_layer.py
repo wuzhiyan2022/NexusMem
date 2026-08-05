@@ -174,6 +174,7 @@ class MemoryLayer:
                 continue
             timestamp = "" if message.timestamp is None else str(message.timestamp)
             for part_index, part in enumerate(split_content(content)):
+                order_index = start_seq + len(raw_records)
                 raw_id = self._raw_id(
                     request.user_id,
                     request.session_id,
@@ -208,7 +209,9 @@ class MemoryLayer:
                         "role": role,
                         "speaker": speaker,
                         "timestamp": timestamp,
+                        "order_index": order_index,
                         "content": part,
+                        "temporal_profile": self.temporal_profile(part, timestamp, order_index),
                         "candidate_ids": [candidate["candidate_id"] for candidate in raw_candidates],
                         "candidate_count": len(raw_candidates),
                         "created_at": int(time.time()),
@@ -241,6 +244,36 @@ class MemoryLayer:
     def load_raw_memory_status(self) -> dict[str, dict[str, Any]]:
         consolidated = self._load_consolidated()
         return self._raw_to_memory_summary(consolidated)
+
+    def load_raw_temporal_profiles(self) -> dict[str, dict[str, Any]]:
+        profiles: dict[str, dict[str, Any]] = {}
+        if not self.raw_path.exists():
+            return profiles
+        with self.raw_path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                raw_id = str(record.get("raw_id") or "")
+                if not raw_id:
+                    continue
+                profile = record.get("temporal_profile")
+                if not isinstance(profile, dict):
+                    profile = self.temporal_profile(
+                        str(record.get("content") or ""),
+                        str(record.get("timestamp") or ""),
+                        int(record.get("order_index") or index),
+                    )
+                profile = dict(profile)
+                profile.setdefault("raw_id", raw_id)
+                profile.setdefault("message_timestamp", str(record.get("timestamp") or ""))
+                profile.setdefault("order_index", int(record.get("order_index") or index))
+                profiles[raw_id] = profile
+        return profiles
 
     @staticmethod
     def parse_raw_id(passage: str) -> str | None:
@@ -1308,6 +1341,43 @@ class MemoryLayer:
         lowered = text.lower()
         return any(hint in lowered for hint in cls.UPDATE_HINTS)
 
+    @classmethod
+    def temporal_profile(cls, text: str, timestamp: str, order_index: int) -> dict[str, Any]:
+        time_expressions = cls._extract_time_expressions(text, timestamp)
+        time_kinds = []
+        for expression in time_expressions:
+            kind = cls._time_kind(expression)
+            if kind not in time_kinds:
+                time_kinds.append(kind)
+        temporal_cues = cls._temporal_cues(text)
+        return {
+            "message_timestamp": timestamp,
+            "order_index": int(order_index),
+            "time_expressions": time_expressions,
+            "time_kinds": time_kinds,
+            "has_explicit_time": bool(time_expressions),
+            "has_relative_time": any(kind == "relative" for kind in time_kinds),
+            "temporal_cues": temporal_cues,
+            "current_score": 1.0 if "current_signal" in temporal_cues else 0.0,
+            "history_score": 1.0 if "history_signal" in temporal_cues else 0.0,
+        }
+
+    @staticmethod
+    def _temporal_cues(text: str) -> list[str]:
+        lowered = str(text or "").lower()
+        cue_patterns = [
+            ("sequence_before", r"\b(?:before|prior to|earlier than|previous to)\b"),
+            ("sequence_after", r"\b(?:after|following|later than|subsequently|afterwards|then|since)\b"),
+            ("current_signal", r"\b(?:now|currently|current|latest|recent|recently|today|these days|at the moment|still|anymore)\b"),
+            ("history_signal", r"\b(?:previously|used to|formerly|past|once|earlier|before|back then)\b"),
+            ("duration_signal", r"\b(?:since|for \d+|from .+ to .+|between .+ and .+|how long)\b"),
+        ]
+        cues: list[str] = []
+        for cue, pattern in cue_patterns:
+            if re.search(pattern, lowered) and cue not in cues:
+                cues.append(cue)
+        return cues
+
     @staticmethod
     def _extract_time_expressions(text: str, timestamp: str) -> list[str]:
         values: list[str] = []
@@ -1409,7 +1479,13 @@ class MemoryLayer:
             return "year"
         if re.search(r"\d{1,2}:\d{2}|\d{1,2}点", lowered):
             return "clock_time"
-        if any(token in lowered for token in ("today", "yesterday", "tomorrow", "last", "next", "recently", "currently", "now")):
+        if any(
+            token in lowered
+            for token in (
+                "today", "yesterday", "tomorrow", "last", "next", "recently", "currently", "now",
+                "before", "previously", "earlier", "later", "since", "used to", "formerly", "once",
+            )
+        ):
             return "relative"
         if any(token in expression for token in ("今天", "昨天", "明天", "去年", "明年", "最近", "目前", "现在", "以前", "曾经")):
             return "relative"

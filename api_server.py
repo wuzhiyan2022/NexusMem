@@ -6,6 +6,8 @@ import json
 import os
 import re
 import threading
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -93,6 +95,15 @@ class LinearRAGMemoryService:
         self.enable_memory_layer = self._env_bool("LINEARRAG_ENABLE_MEMORY_LAYER", True)
         self.enable_status_rerank = self._env_bool("LINEARRAG_ENABLE_STATUS_RERANK", True)
         self.enable_evidence_rerank = self._env_bool("LINEARRAG_ENABLE_EVIDENCE_RERANK", True)
+        self.enable_llm_query_intent = self._env_bool("LINEARRAG_ENABLE_LLM_QUERY_INTENT", True)
+        self.query_llm_model = os.getenv("LINEARRAG_QUERY_LLM_MODEL", "gpt-4o-mini").strip()
+        self.query_llm_base_url = (
+            os.getenv("LINEARRAG_QUERY_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or ""
+        ).strip().rstrip("/")
+        self.query_llm_api_key = (
+            os.getenv("LINEARRAG_QUERY_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        ).strip()
+        self.query_llm_timeout = float(os.getenv("LINEARRAG_QUERY_LLM_TIMEOUT", "4"))
         self.enable_structured_memory_graph = self._env_bool("LINEARRAG_ENABLE_STRUCTURED_MEMORY_GRAPH", True)
         self.structured_node_top_k = int(os.getenv("LINEARRAG_STRUCTURED_NODE_TOP_K", "24"))
         self.structured_node_weight = float(os.getenv("LINEARRAG_STRUCTURED_NODE_WEIGHT", "0.35"))
@@ -106,6 +117,7 @@ class LinearRAGMemoryService:
         self.users_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.rag_cache: OrderedDict[str, LinearRAG] = OrderedDict()
+        self.query_intent_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
         device = os.getenv("LINEARRAG_DEVICE") or self._default_device()
         self.embedding_model = SentenceTransformer(self.embedding_model_path, device=device)
@@ -395,28 +407,57 @@ class LinearRAGMemoryService:
             return ranked
 
         raw_status: dict[str, Any] = {}
+        raw_temporal_profiles: dict[str, dict[str, Any]] = {}
         intent = MemoryLayer.query_intent(query)
-        if self.enable_memory_layer and self.enable_status_rerank:
+        temporal_intent = self._query_temporal_intent(query)
+        if self.enable_memory_layer and (self.enable_status_rerank or self.enable_evidence_rerank):
             try:
                 layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
-                raw_status = layer.load_raw_memory_status()
+                if self.enable_status_rerank:
+                    raw_status = layer.load_raw_memory_status()
+                if self.enable_evidence_rerank:
+                    raw_temporal_profiles = layer.load_raw_temporal_profiles()
             except Exception:
                 raw_status = {}
+                raw_temporal_profiles = {}
+
+        passage_profiles: dict[str, dict[str, Any]] = {}
+        for passage, _ in ranked:
+            raw_id = MemoryLayer.parse_raw_id(passage)
+            if raw_id and raw_id in raw_temporal_profiles:
+                passage_profiles[passage] = raw_temporal_profiles[raw_id]
+        temporal_context = self._temporal_context(passage_profiles.values())
 
         adjusted = []
         for passage, score in ranked:
             adjusted_score = score
+            raw_id = MemoryLayer.parse_raw_id(passage)
             if raw_status:
-                raw_id = MemoryLayer.parse_raw_id(passage)
                 status_info = raw_status.get(raw_id) if raw_id else None
                 adjusted_score = MemoryLayer.adjust_score(adjusted_score, status_info, intent)
             if self.enable_evidence_rerank:
-                adjusted_score *= self._evidence_rerank_factor(query, options, passage)
+                temporal_profile = passage_profiles.get(passage, {})
+                adjusted_score *= self._evidence_rerank_factor(
+                    query,
+                    options,
+                    passage,
+                    temporal_intent,
+                    temporal_profile,
+                    temporal_context,
+                )
             adjusted.append((passage, adjusted_score))
         adjusted.sort(key=lambda item: item[1], reverse=True)
         return adjusted
 
-    def _evidence_rerank_factor(self, query: str, options: list[str], passage: str) -> float:
+    def _evidence_rerank_factor(
+        self,
+        query: str,
+        options: list[str],
+        passage: str,
+        temporal_intent: dict[str, Any] | None = None,
+        temporal_profile: dict[str, Any] | None = None,
+        temporal_context: dict[str, float] | None = None,
+    ) -> float:
         content = self._strip_internal_prefix(passage)
         content_lower = content.lower()
         query_tokens = self._rerank_tokens(query)
@@ -441,7 +482,218 @@ class LinearRAGMemoryService:
             factor += 0.05
 
         factor += self._best_option_match(options, passage_tokens, content_lower)
-        return max(0.75, min(1.75, factor))
+        factor *= self._temporal_rerank_factor(temporal_intent or {}, temporal_profile or {}, temporal_context or {})
+        return max(0.70, min(1.90, factor))
+
+    def _query_temporal_intent(self, query: str) -> dict[str, Any]:
+        cache_key = query.strip().lower()
+        cached = self.query_intent_cache.get(cache_key)
+        if cached is not None:
+            self.query_intent_cache.move_to_end(cache_key)
+            return cached
+
+        intent = self._rule_query_temporal_intent(query)
+        if self.enable_llm_query_intent and self.query_llm_api_key and self.query_llm_base_url:
+            llm_intent = self._llm_query_temporal_intent(query)
+            if llm_intent:
+                intent.update(llm_intent)
+                intent["source"] = "llm"
+        self.query_intent_cache[cache_key] = intent
+        self.query_intent_cache.move_to_end(cache_key)
+        while len(self.query_intent_cache) > 256:
+            self.query_intent_cache.popitem(last=False)
+        return intent
+
+    @staticmethod
+    def _rule_query_temporal_intent(query: str) -> dict[str, Any]:
+        lowered = query.lower()
+        temporal_intent = "neutral"
+        if re.search(r"\bhow long|since when|for how many|duration\b", lowered):
+            temporal_intent = "duration"
+        elif re.search(r"\bbefore|prior to|earlier than\b", lowered):
+            temporal_intent = "sequence_before"
+        elif re.search(r"\bafter|following|later than|subsequently|since\b", lowered):
+            temporal_intent = "sequence_after"
+        elif re.search(r"\bcurrently|current|now|latest|still|anymore|at the moment\b", lowered):
+            temporal_intent = "current_state"
+        elif re.search(r"\bpreviously|used to|formerly|past|once|before\b", lowered):
+            temporal_intent = "history_state"
+        elif re.search(r"\brecently|most recent|latest\b", lowered):
+            temporal_intent = "recent"
+        elif re.search(r"\bwhen|what date|which date|what day|which day|what month|what year|date|time\b", lowered):
+            temporal_intent = "when_exact"
+        return {
+            "temporal_intent": temporal_intent,
+            "prefer_current": temporal_intent in {"current_state", "recent", "sequence_after"},
+            "prefer_history": temporal_intent in {"history_state", "sequence_before"},
+            "prefer_recent": temporal_intent in {"recent", "current_state"},
+            "needs_explicit_time": temporal_intent in {"when_exact", "duration"},
+            "sequence_direction": "before" if temporal_intent == "sequence_before" else "after" if temporal_intent == "sequence_after" else "",
+            "anchor_event": "",
+            "target": "",
+            "confidence": 0.45 if temporal_intent != "neutral" else 0.2,
+            "source": "rule",
+        }
+
+    def _llm_query_temporal_intent(self, query: str) -> dict[str, Any] | None:
+        url = self._chat_completions_url(self.query_llm_base_url)
+        prompt = (
+            "You parse the temporal intent of a memory search query. "
+            "Return only a compact JSON object. Allowed temporal_intent values: "
+            "when_exact, current_state, history_state, sequence_before, sequence_after, "
+            "recent, duration, neutral. Include keys: temporal_intent, target, anchor_event, "
+            "prefer_current, prefer_history, prefer_recent, needs_explicit_time, "
+            "sequence_direction, confidence."
+        )
+        payload = {
+            "model": self.query_llm_model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": query},
+            ],
+            "temperature": 0,
+            "max_tokens": 180,
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.query_llm_api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.query_llm_timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+            data = self._parse_json_object(content)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        allowed = {
+            "when_exact", "current_state", "history_state", "sequence_before", "sequence_after",
+            "recent", "duration", "neutral",
+        }
+        temporal_intent = str(data.get("temporal_intent") or "neutral").strip()
+        if temporal_intent not in allowed:
+            temporal_intent = "neutral"
+        return {
+            "temporal_intent": temporal_intent,
+            "target": str(data.get("target") or ""),
+            "anchor_event": str(data.get("anchor_event") or ""),
+            "prefer_current": bool(data.get("prefer_current")),
+            "prefer_history": bool(data.get("prefer_history")),
+            "prefer_recent": bool(data.get("prefer_recent")),
+            "needs_explicit_time": bool(data.get("needs_explicit_time")),
+            "sequence_direction": str(data.get("sequence_direction") or ""),
+            "confidence": max(0.0, min(1.0, float(data.get("confidence") or 0.0))),
+        }
+
+    @staticmethod
+    def _chat_completions_url(base_url: str) -> str:
+        value = base_url.rstrip("/")
+        if value.endswith("/chat/completions"):
+            return value
+        return value + "/chat/completions"
+
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any] | None:
+        cleaned = text.strip()
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+        try:
+            data = json.loads(cleaned)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _temporal_context(profiles: Any) -> dict[str, float]:
+        values = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            value = MemoryLayer._time_value(profile.get("message_timestamp"))
+            if not value:
+                value = MemoryLayer._time_value(profile.get("order_index"))
+            if value:
+                values.append(value)
+        if not values:
+            return {"min": 0.0, "max": 0.0}
+        return {"min": min(values), "max": max(values)}
+
+    @staticmethod
+    def _temporal_rerank_factor(
+        temporal_intent: dict[str, Any],
+        profile: dict[str, Any],
+        temporal_context: dict[str, float],
+    ) -> float:
+        intent = str(temporal_intent.get("temporal_intent") or "neutral")
+        if intent == "neutral":
+            return 1.0
+        cues = set(profile.get("temporal_cues") or [])
+        kinds = set(profile.get("time_kinds") or [])
+        has_time = bool(profile.get("has_explicit_time"))
+        factor = 1.0
+
+        if intent == "when_exact":
+            if has_time:
+                factor += 0.10
+            if kinds & {"date", "year", "clock_time"}:
+                factor += 0.08
+            elif kinds & {"relative"}:
+                factor += 0.04
+        elif intent == "duration":
+            if "duration_signal" in cues:
+                factor += 0.14
+            if has_time:
+                factor += 0.05
+        elif intent == "current_state":
+            factor += 0.10 * LinearRAGMemoryService._candidate_recency(profile, temporal_context)
+            if "current_signal" in cues:
+                factor += 0.10
+            if "history_signal" in cues:
+                factor -= 0.08
+        elif intent == "history_state":
+            factor += 0.10 * (1.0 - LinearRAGMemoryService._candidate_recency(profile, temporal_context))
+            if "history_signal" in cues:
+                factor += 0.10
+            if "current_signal" in cues:
+                factor -= 0.06
+        elif intent == "sequence_before":
+            factor += 0.08 * (1.0 - LinearRAGMemoryService._candidate_recency(profile, temporal_context))
+            if cues & {"sequence_before", "history_signal"}:
+                factor += 0.08
+            if "current_signal" in cues:
+                factor -= 0.05
+        elif intent == "sequence_after":
+            factor += 0.08 * LinearRAGMemoryService._candidate_recency(profile, temporal_context)
+            if cues & {"sequence_after", "current_signal"}:
+                factor += 0.08
+        elif intent == "recent":
+            factor += 0.12 * LinearRAGMemoryService._candidate_recency(profile, temporal_context)
+            if "current_signal" in cues:
+                factor += 0.08
+            if "history_signal" in cues:
+                factor -= 0.05
+
+        return max(0.85, min(1.28, factor))
+
+    @staticmethod
+    def _candidate_recency(profile: dict[str, Any], temporal_context: dict[str, float]) -> float:
+        value = MemoryLayer._time_value(profile.get("message_timestamp"))
+        if not value:
+            value = MemoryLayer._time_value(profile.get("order_index"))
+        low = float(temporal_context.get("min") or 0.0)
+        high = float(temporal_context.get("max") or 0.0)
+        if not value or high <= low:
+            return 0.5
+        return max(0.0, min(1.0, (value - low) / (high - low)))
 
     @classmethod
     def _rerank_tokens(cls, text: str) -> set[str]:
