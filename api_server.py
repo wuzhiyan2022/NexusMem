@@ -8,7 +8,7 @@ import re
 import threading
 import urllib.error
 import urllib.request
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +95,10 @@ class LinearRAGMemoryService:
         self.enable_memory_layer = self._env_bool("LINEARRAG_ENABLE_MEMORY_LAYER", True)
         self.enable_status_rerank = self._env_bool("LINEARRAG_ENABLE_STATUS_RERANK", True)
         self.enable_evidence_rerank = self._env_bool("LINEARRAG_ENABLE_EVIDENCE_RERANK", True)
+        self.enable_memory_sidecar_retrieval = self._env_bool("LINEARRAG_ENABLE_MEMORY_SIDECAR_RETRIEVAL", True)
+        self.memory_sidecar_top_k = int(os.getenv("LINEARRAG_MEMORY_SIDECAR_TOP_K", "16"))
+        self.memory_sidecar_weight = float(os.getenv("LINEARRAG_MEMORY_SIDECAR_WEIGHT", "1.15"))
+        self.memory_sidecar_min_fit = float(os.getenv("LINEARRAG_MEMORY_SIDECAR_MIN_FIT", "0.22"))
         self.enable_llm_query_intent = self._env_bool("LINEARRAG_ENABLE_LLM_QUERY_INTENT", True)
         self.query_llm_model = os.getenv("LINEARRAG_QUERY_LLM_MODEL", "gpt-4o-mini").strip()
         self.query_llm_base_url = (
@@ -214,7 +218,16 @@ class LinearRAGMemoryService:
 
             data = []
             seen_ids: set[str] = set()
-            ranked_results = self._rank_search_results(user_key, raw_query, request.options or [], passages, scores, limit)
+            all_passages_by_raw_id = self._all_passages_by_raw_id(rag)
+            ranked_results = self._rank_search_results(
+                user_key,
+                raw_query,
+                request.options or [],
+                passages,
+                scores,
+                limit,
+                all_passages_by_raw_id,
+            )
             for passage, score in ranked_results:
                 memory_id = rag.passage_embedding_store.text_to_hash_id.get(passage)
                 if memory_id is None:
@@ -518,9 +531,19 @@ class LinearRAGMemoryService:
                 query = f"{query}\nOptions:\n{options}"
         return query
 
+    @staticmethod
+    def _all_passages_by_raw_id(rag: LinearRAG) -> dict[str, list[str]]:
+        passages_by_raw_id: dict[str, list[str]] = defaultdict(list)
+        for passage in getattr(rag.passage_embedding_store, "texts", []) or []:
+            raw_id = MemoryLayer.parse_raw_id(passage)
+            if raw_id:
+                passages_by_raw_id[raw_id].append(passage)
+        return dict(passages_by_raw_id)
+
     def _retrieve_limit(self, limit: int) -> int:
         has_status_rerank = self.enable_memory_layer and self.enable_status_rerank
-        if not (has_status_rerank or self.enable_evidence_rerank):
+        has_sidecar_retrieval = self.enable_memory_layer and self.enable_memory_sidecar_retrieval
+        if not (has_status_rerank or self.enable_evidence_rerank or has_sidecar_retrieval):
             return limit
         multiplier = max(1, self.rerank_candidate_multiplier)
         max_candidates = max(limit, self.rerank_max_candidates)
@@ -534,6 +557,7 @@ class LinearRAGMemoryService:
         passages: list[str],
         scores: list[float],
         limit: int,
+        all_passages_by_raw_id: dict[str, list[str]] | None = None,
     ) -> list[tuple[str, float]]:
         ranked = [(passage, float(score)) for passage, score in zip(passages, scores)]
         if not ranked:
@@ -542,18 +566,34 @@ class LinearRAGMemoryService:
         query_profile = self._query_evidence_profile(query, options)
         raw_status: dict[str, Any] = {}
         raw_temporal_profiles: dict[str, dict[str, Any]] = {}
+        memory_sidecar_matches: list[dict[str, Any]] = []
+        memory_sidecar_raw_boosts: dict[str, float] = {}
         intent = MemoryLayer.query_intent(query)
         temporal_intent = self._query_temporal_intent(query)
-        if self.enable_memory_layer and (self.enable_status_rerank or self.enable_evidence_rerank):
+        needs_memory_sidecar = self.enable_memory_layer and self.enable_memory_sidecar_retrieval
+        if self.enable_memory_layer and (
+            self.enable_status_rerank or self.enable_evidence_rerank or needs_memory_sidecar
+        ):
             try:
                 layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
                 if self.enable_status_rerank:
                     raw_status = layer.load_raw_memory_status()
                 if self.enable_evidence_rerank:
                     raw_temporal_profiles = layer.load_raw_temporal_profiles()
+                if needs_memory_sidecar:
+                    memory_sidecar_matches = self._match_sidecar_memories(
+                        layer.load_consolidated_memories(),
+                        query,
+                        query_profile,
+                        intent,
+                        temporal_intent,
+                    )
+                    memory_sidecar_raw_boosts = self._sidecar_raw_boosts(memory_sidecar_matches)
             except Exception:
                 raw_status = {}
                 raw_temporal_profiles = {}
+                memory_sidecar_matches = []
+                memory_sidecar_raw_boosts = {}
 
         passage_profiles: dict[str, dict[str, Any]] = {}
         for passage, _ in ranked:
@@ -571,6 +611,10 @@ class LinearRAGMemoryService:
             if raw_status:
                 status_info = raw_status.get(raw_id) if raw_id else None
                 adjusted_score = MemoryLayer.adjust_score(adjusted_score, status_info, intent)
+            if raw_id and memory_sidecar_raw_boosts:
+                sidecar_boost = memory_sidecar_raw_boosts.get(raw_id, 0.0)
+                if sidecar_boost > 0.0:
+                    adjusted_score += max_base_score * self.memory_sidecar_weight * sidecar_boost
             if self.enable_evidence_rerank:
                 temporal_profile = passage_profiles.get(passage, {})
                 evidence_signal = self._direct_evidence_score(
@@ -595,6 +639,16 @@ class LinearRAGMemoryService:
                 adjusted_score += max_base_score * self.evidence_signal_weight * evidence_signal
                 adjusted_score += max_base_score * 0.08 * rank_prior
             adjusted.append((passage, adjusted_score))
+        if memory_sidecar_raw_boosts and all_passages_by_raw_id:
+            adjusted = self._append_sidecar_evidence(
+                adjusted,
+                all_passages_by_raw_id,
+                memory_sidecar_raw_boosts,
+                raw_temporal_profiles,
+                passage_profiles,
+                max_base_score,
+                limit,
+            )
         adjusted.sort(key=lambda item: item[1], reverse=True)
         adjusted = self._complete_neighbor_evidence(query_profile, adjusted, limit)
         self._write_search_debug(
@@ -607,8 +661,196 @@ class LinearRAGMemoryService:
             passage_profiles,
             temporal_context,
             anchor_context,
+            memory_sidecar_matches,
+            memory_sidecar_raw_boosts,
         )
         return adjusted
+
+    def _append_sidecar_evidence(
+        self,
+        ranked: list[tuple[str, float]],
+        all_passages_by_raw_id: dict[str, list[str]],
+        raw_boosts: dict[str, float],
+        raw_temporal_profiles: dict[str, dict[str, Any]],
+        passage_profiles: dict[str, dict[str, Any]],
+        max_base_score: float,
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        if not raw_boosts:
+            return ranked
+        seen_passages = {passage for passage, _ in ranked}
+        seen_raw_ids = {raw_id for raw_id in (MemoryLayer.parse_raw_id(passage) for passage, _ in ranked) if raw_id}
+        max_extra = min(max(0, int(self.memory_sidecar_top_k)), max(limit, 1))
+        added = 0
+        expanded = list(ranked)
+        for raw_id, boost in sorted(raw_boosts.items(), key=lambda item: item[1], reverse=True):
+            if added >= max_extra:
+                break
+            if raw_id in seen_raw_ids:
+                continue
+            for passage in all_passages_by_raw_id.get(raw_id, []):
+                if passage in seen_passages:
+                    continue
+                score = max_base_score * self.memory_sidecar_weight * max(0.05, min(1.0, float(boost)))
+                expanded.append((passage, score))
+                seen_passages.add(passage)
+                seen_raw_ids.add(raw_id)
+                if raw_id in raw_temporal_profiles:
+                    passage_profiles.setdefault(passage, raw_temporal_profiles[raw_id])
+                added += 1
+                break
+        return expanded
+
+    def _match_sidecar_memories(
+        self,
+        memories: list[dict[str, Any]],
+        query: str,
+        query_profile: dict[str, Any],
+        intent: str,
+        temporal_intent: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        matches: list[dict[str, Any]] = []
+        if not memories:
+            return matches
+        min_fit = max(0.0, float(self.memory_sidecar_min_fit))
+        for memory in memories:
+            if not isinstance(memory, dict):
+                continue
+            raw_ids = [str(raw_id) for raw_id in memory.get("evidence_raw_ids") or [] if str(raw_id)]
+            if not raw_ids:
+                continue
+            fit = self._memory_sidecar_fit_score(memory, query, query_profile, temporal_intent)
+            if fit < min_fit:
+                continue
+            status = str(memory.get("status") or "active")
+            confidence = max(
+                MemoryLayer._safe_float(memory.get("confidence")),
+                MemoryLayer._safe_float(memory.get("llm_confidence")),
+                0.55,
+            )
+            score = fit * self._memory_sidecar_status_factor(status, intent) * (0.85 + 0.20 * confidence)
+            if score <= 0.0:
+                continue
+            matches.append(
+                {
+                    "memory_id": str(memory.get("memory_id") or ""),
+                    "memory_type": str(memory.get("memory_type") or ""),
+                    "status": status,
+                    "score": max(0.0, min(1.0, score)),
+                    "fit": fit,
+                    "evidence_raw_ids": raw_ids,
+                }
+            )
+        matches.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        top_k = max(0, int(self.memory_sidecar_top_k))
+        return matches[:top_k] if top_k else matches
+
+    @classmethod
+    def _memory_sidecar_fit_score(
+        cls,
+        memory: dict[str, Any],
+        query: str,
+        query_profile: dict[str, Any],
+        temporal_intent: dict[str, Any],
+    ) -> float:
+        text = cls._memory_sidecar_text(memory)
+        lowered = text.lower()
+        memory_tokens = cls._rerank_tokens(text)
+        if not memory_tokens:
+            return 0.0
+
+        topic_tokens = set(query_profile.get("topic_tokens") or [])
+        topic_fit = 0.0
+        if topic_tokens:
+            topic_fit = len(topic_tokens & memory_tokens) / max(len(topic_tokens), 1)
+
+        target_tokens = set(query_profile.get("target_speaker_tokens") or [])
+        for value in query_profile.get("target_speakers") or []:
+            target_tokens |= cls._rerank_tokens(str(value))
+        target = str(temporal_intent.get("target") or "")
+        anchor_event = str(temporal_intent.get("anchor_event") or "")
+        target_tokens |= cls._rerank_tokens(target)
+        target_tokens |= cls._rerank_tokens(anchor_event)
+        target_fit = 0.0
+        if target_tokens:
+            target_fit = len(target_tokens & memory_tokens) / max(len(target_tokens), 1)
+            target_phrase = " ".join(sorted(target_tokens))
+            if target_phrase and target_phrase in lowered:
+                target_fit = max(target_fit, 0.75)
+
+        answer_fit = cls._answer_type_signal(query_profile, text, {})
+        memory_type = str(memory.get("memory_type") or "")
+        answer_type = str(query_profile.get("answer_type") or "")
+        if answer_type == "relation" and memory_type == "relation":
+            answer_fit = max(answer_fit, 0.70)
+        elif answer_type in {"time", "duration"} and memory.get("time_expressions"):
+            answer_fit = max(answer_fit, 0.65)
+        elif answer_type == "location" and memory_type in {"fact", "event"}:
+            answer_fit = max(answer_fit, 0.35)
+
+        temporal_fit = 0.0
+        query_times = cls._time_values(query)
+        if query_times:
+            temporal_fit = 1.0 if any(value and value in lowered for value in query_times) else 0.0
+        temporal_target_tokens = cls._rerank_tokens(target) | cls._rerank_tokens(anchor_event)
+        if temporal_target_tokens:
+            temporal_fit = max(
+                temporal_fit,
+                len(temporal_target_tokens & memory_tokens) / max(len(temporal_target_tokens), 1),
+            )
+
+        score = 0.58 * topic_fit + 0.16 * target_fit + 0.14 * answer_fit + 0.12 * temporal_fit
+        if not topic_tokens:
+            score = max(score, 0.55 * target_fit + 0.25 * answer_fit + 0.20 * temporal_fit)
+        if topic_fit == 0.0 and target_fit == 0.0 and temporal_fit == 0.0:
+            score *= 0.35
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _memory_sidecar_text(memory: dict[str, Any]) -> str:
+        parts = [
+            str(memory.get("memory_type") or ""),
+            str(memory.get("status") or ""),
+            str(memory.get("subject") or ""),
+            str(memory.get("predicate") or ""),
+            str(memory.get("object") or ""),
+            str(memory.get("source_text") or ""),
+            " ".join(str(value) for value in memory.get("time_expressions") or []),
+        ]
+        return " ".join(part for part in parts if part).strip()
+
+    @staticmethod
+    def _memory_sidecar_status_factor(status: str, intent: str) -> float:
+        normalized = str(status or "active").lower()
+        normalized_intent = str(intent or "neutral").lower()
+        if normalized == "active":
+            if normalized_intent == "history":
+                return 0.82
+            return 1.12 if normalized_intent == "current" else 1.0
+        if normalized in {"expired", "superseded"}:
+            if normalized_intent == "history":
+                return 1.12
+            if normalized_intent == "current":
+                return 0.42
+            return 0.66
+        if normalized == "conflicting":
+            return 0.72 if normalized_intent != "history" else 0.86
+        return 0.85
+
+    @staticmethod
+    def _sidecar_raw_boosts(matches: list[dict[str, Any]]) -> dict[str, float]:
+        boosts: dict[str, float] = {}
+        for match in matches:
+            try:
+                score = float(match.get("score") or 0.0)
+            except Exception:
+                score = 0.0
+            for raw_id in match.get("evidence_raw_ids") or []:
+                raw_id = str(raw_id or "")
+                if not raw_id:
+                    continue
+                boosts[raw_id] = max(boosts.get(raw_id, 0.0), score)
+        return boosts
 
     def _evidence_rerank_factor(
         self,
@@ -1412,6 +1654,8 @@ class LinearRAGMemoryService:
         passage_profiles: dict[str, dict[str, Any]],
         temporal_context: dict[str, float],
         anchor_context: dict[str, Any],
+        memory_sidecar_matches: list[dict[str, Any]] | None = None,
+        memory_sidecar_raw_boosts: dict[str, float] | None = None,
     ) -> None:
         if not self.enable_search_debug:
             return
@@ -1429,6 +1673,7 @@ class LinearRAGMemoryService:
                         "raw_id": raw_id,
                         "base_score": score_by_passage.get(passage),
                         "adjusted_score": adjusted_score,
+                        "memory_sidecar_boost": (memory_sidecar_raw_boosts or {}).get(raw_id, 0.0),
                         "temporal_profile": profile,
                         "content_preview": self._strip_internal_prefix(passage)[:240],
                     }
@@ -1444,6 +1689,7 @@ class LinearRAGMemoryService:
                             "temporal_intent": temporal_intent,
                             "temporal_context": temporal_context,
                             "anchor_context": anchor_context,
+                            "memory_sidecar_matches": memory_sidecar_matches or [],
                             "candidates": rows,
                         },
                         ensure_ascii=False,

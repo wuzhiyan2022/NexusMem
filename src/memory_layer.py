@@ -279,6 +279,9 @@ class MemoryLayer:
         consolidated = self._load_consolidated()
         return self._raw_to_memory_summary(consolidated)
 
+    def load_consolidated_memories(self) -> list[dict[str, Any]]:
+        return self._load_consolidated()
+
     def load_raw_temporal_profiles(self) -> dict[str, dict[str, Any]]:
         profiles: dict[str, dict[str, Any]] = {}
         if not self.raw_path.exists():

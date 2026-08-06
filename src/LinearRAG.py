@@ -669,8 +669,6 @@ class LinearRAG:
                 boosted[idx] += 0.35
             if node_type == "event" and self._is_temporal_question(question):
                 boosted[idx] += 0.05
-            if node_type == "memory" and self._is_memory_status_question(question):
-                boosted[idx] += 0.05
         return boosted
 
     @staticmethod
@@ -714,8 +712,6 @@ class LinearRAG:
     def _structured_type_weight(self, node_type):
         if node_type == "event":
             return float(getattr(self.config, "structured_event_weight", 1.0))
-        if node_type == "memory":
-            return float(getattr(self.config, "structured_memory_weight", 0.9))
         if node_type == "time":
             return float(getattr(self.config, "structured_time_weight", 0.8))
         return 1.0
@@ -792,7 +788,6 @@ class LinearRAG:
         raw_to_passages = self._raw_id_to_passage_hash_ids(hash_id_to_passage)
         events = self._load_json_list(os.path.join(user_dir, "event_nodes.json"))
         times = self._load_json_list(os.path.join(user_dir, "time_nodes.json"))
-        memories = self._load_json_list(os.path.join(user_dir, "consolidated_memories.json"))
         graph_edges = self._load_jsonl(os.path.join(user_dir, "memory_graph_edges.jsonl"))
 
         valid_time_ids = set()
@@ -817,36 +812,9 @@ class LinearRAG:
                 0.45,
             )
 
-        for memory in memories:
-            memory_id = str(memory.get("memory_id") or "")
-            if not memory_id:
-                continue
-            status = str(memory.get("status") or "active")
-            self._add_structured_node(memory_id, "memory", self._memory_node_text(memory))
-            self.structured_node_status[memory_id] = status
-            evidence_weight = self._memory_evidence_weight(status)
-            for raw_id in memory.get("evidence_raw_ids") or []:
-                for passage_id in raw_to_passages.get(str(raw_id), []):
-                    self._add_weighted_edge(memory_id, passage_id, evidence_weight)
-            event_id = str(memory.get("event_id") or "")
-            if event_id:
-                self._add_weighted_edge(memory_id, event_id, 0.75)
-            for time_id in memory.get("time_node_ids") or []:
-                time_id = str(time_id)
-                if time_id in valid_time_ids:
-                    self._add_weighted_edge(memory_id, time_id, 0.65)
-            self._connect_structured_node_to_entities(
-                memory_id,
-                [memory.get("subject"), memory.get("object")],
-                0.35,
-            )
-            for old_id in memory.get("supersedes") or []:
-                self._add_weighted_edge(memory_id, str(old_id), 0.18)
-            if memory.get("superseded_by"):
-                self._add_weighted_edge(memory_id, str(memory.get("superseded_by")), 0.18)
-            for conflict_id in memory.get("conflicts_with") or []:
-                self._add_weighted_edge(memory_id, str(conflict_id), 0.12)
-
+        # Consolidated memories are kept as sidecar state for API reranking.
+        # The main graph uses only evidence-like nodes to avoid memory-state
+        # edges creating broad, noisy activation paths.
         for edge in graph_edges:
             source_id = str(edge.get("source_id") or "")
             target_id = str(edge.get("target_id") or "")
@@ -854,11 +822,13 @@ class LinearRAG:
             if not source_id or not target_id:
                 continue
             if edge_type == "evidence":
+                if source_id not in self.structured_node_texts:
+                    continue
                 if self._is_time_structured_node(source_id, valid_time_ids):
                     continue
                 for passage_id in raw_to_passages.get(target_id, []):
                     self._add_weighted_edge(source_id, passage_id, 1.0)
-            elif edge_type == "occurs_at" and target_id in valid_time_ids:
+            elif edge_type == "occurs_at" and source_id in self.structured_node_texts and target_id in valid_time_ids:
                 self._add_weighted_edge(source_id, target_id, 0.85)
 
         self.structured_node_ids = list(self.structured_node_texts.keys())
