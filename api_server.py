@@ -1394,19 +1394,23 @@ class LinearRAGMemoryService:
             "when_exact", "current_state", "history_state", "sequence_before", "sequence_after",
             "recent", "duration", "neutral",
         }
-        temporal_intent = str(data.get("temporal_intent") or "neutral").strip()
+        temporal_intent = str(data.get("temporal_intent") or "neutral").strip().lower()
+        temporal_intent = temporal_intent.replace("-", "_").replace(" ", "_")
         if temporal_intent not in allowed:
             temporal_intent = "neutral"
+        sequence_direction = str(data.get("sequence_direction") or "").strip().lower()
+        if sequence_direction not in {"before", "after"}:
+            sequence_direction = ""
         return {
             "temporal_intent": temporal_intent,
             "target": str(data.get("target") or ""),
             "anchor_event": str(data.get("anchor_event") or ""),
-            "prefer_current": bool(data.get("prefer_current")),
-            "prefer_history": bool(data.get("prefer_history")),
-            "prefer_recent": bool(data.get("prefer_recent")),
-            "needs_explicit_time": bool(data.get("needs_explicit_time")),
-            "sequence_direction": str(data.get("sequence_direction") or ""),
-            "confidence": max(0.0, min(1.0, float(data.get("confidence") or 0.0))),
+            "prefer_current": self._safe_llm_bool(data.get("prefer_current")),
+            "prefer_history": self._safe_llm_bool(data.get("prefer_history")),
+            "prefer_recent": self._safe_llm_bool(data.get("prefer_recent")),
+            "needs_explicit_time": self._safe_llm_bool(data.get("needs_explicit_time")),
+            "sequence_direction": sequence_direction,
+            "confidence": MemoryLayer._safe_float(data.get("confidence")),
         }
 
     @staticmethod
@@ -1429,6 +1433,19 @@ class LinearRAGMemoryService:
         except Exception:
             return None
         return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _safe_llm_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        normalized = str(value or "").strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "none", "null", ""}:
+            return False
+        return False
 
     @staticmethod
     def _temporal_context(profiles: Any) -> dict[str, float]:
@@ -1458,7 +1475,7 @@ class LinearRAGMemoryService:
         cues = set(profile.get("temporal_cues") or [])
         kinds = set(profile.get("time_kinds") or [])
         has_time = bool(profile.get("has_explicit_time"))
-        confidence = max(0.0, min(1.0, float(temporal_intent.get("confidence") or 0.0)))
+        confidence = MemoryLayer._safe_float(temporal_intent.get("confidence"))
         factor = 1.0
 
         if intent == "when_exact":

@@ -936,6 +936,23 @@ class MemoryLayer:
 
     @staticmethod
     def _safe_float(value: Any) -> float:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            confidence_labels = {
+                "none": 0.0,
+                "very low": 0.10,
+                "low": 0.25,
+                "medium": 0.55,
+                "moderate": 0.55,
+                "mid": 0.55,
+                "high": 0.85,
+                "very high": 0.95,
+            }
+            if normalized in confidence_labels:
+                return confidence_labels[normalized]
+            percent_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*%", normalized)
+            if percent_match:
+                return max(0.0, min(1.0, float(percent_match.group(1)) / 100.0))
         try:
             return max(0.0, min(1.0, float(value)))
         except Exception:
@@ -1742,7 +1759,10 @@ class MemoryLayer:
             self._append_unique(memory.setdefault("time_expressions", []), event_time)
         for time_id in candidate.get("time_node_ids") or []:
             self._append_unique(memory.setdefault("time_node_ids", []), time_id)
-        memory["confidence"] = max(float(memory.get("confidence") or 0.0), float(candidate.get("confidence") or 0.0))
+        memory["confidence"] = max(
+            self._safe_float(memory.get("confidence")),
+            self._safe_float(candidate.get("confidence")),
+        )
         memory["updated_at"] = int(time.time())
 
     @staticmethod
