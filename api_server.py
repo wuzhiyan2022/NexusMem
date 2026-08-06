@@ -116,9 +116,30 @@ class LinearRAGMemoryService:
         self.extract_llm_api_key = (
             os.getenv("LINEARRAG_EXTRACT_LLM_API_KEY") or self.query_llm_api_key
         ).strip()
-        self.extract_llm_timeout = float(os.getenv("LINEARRAG_EXTRACT_LLM_TIMEOUT", "8"))
+        self.enable_lightweight_llm_extraction = self._env_bool("LINEARRAG_ENABLE_LIGHTWEIGHT_LLM_EXTRACTION", True)
+        self.extract_llm_timeout = float(os.getenv("LINEARRAG_EXTRACT_LLM_TIMEOUT", "2.0"))
         self.extract_llm_batch_size = int(os.getenv("LINEARRAG_EXTRACT_LLM_BATCH_SIZE", "8"))
-        self.extract_llm_max_tokens = int(os.getenv("LINEARRAG_EXTRACT_LLM_MAX_TOKENS", "1800"))
+        self.extract_llm_max_tokens = int(os.getenv("LINEARRAG_EXTRACT_LLM_MAX_TOKENS", "900"))
+        if self.enable_lightweight_llm_extraction:
+            self.extract_llm_timeout = min(
+                self.extract_llm_timeout,
+                float(os.getenv("LINEARRAG_EXTRACT_LLM_TIMEOUT_CAP", "2.0")),
+            )
+            self.extract_llm_batch_size = min(
+                self.extract_llm_batch_size,
+                int(os.getenv("LINEARRAG_EXTRACT_LLM_BATCH_SIZE_CAP", "8")),
+            )
+            self.extract_llm_max_tokens = min(
+                self.extract_llm_max_tokens,
+                int(os.getenv("LINEARRAG_EXTRACT_LLM_MAX_TOKENS_CAP", "900")),
+            )
+        self.extract_llm_max_sentences_per_add = int(
+            os.getenv(
+                "LINEARRAG_EXTRACT_LLM_MAX_SENTENCES_PER_ADD",
+                "8" if self.enable_lightweight_llm_extraction else "-1",
+            )
+        )
+        self.extract_llm_min_sentence_score = float(os.getenv("LINEARRAG_EXTRACT_LLM_MIN_SENTENCE_SCORE", "1.0"))
         self.enable_structured_memory_graph = self._env_bool("LINEARRAG_ENABLE_STRUCTURED_MEMORY_GRAPH", True)
         self.structured_node_top_k = int(os.getenv("LINEARRAG_STRUCTURED_NODE_TOP_K", "24"))
         self.structured_node_weight = float(os.getenv("LINEARRAG_STRUCTURED_NODE_WEIGHT", "0.35"))
@@ -291,15 +312,25 @@ class LinearRAGMemoryService:
 
         layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
         llm_extractor = self._extract_llm_structured_memory if self._llm_memory_extraction_ready() else None
-        return layer.build_passages(
-            request,
-            self._split_content,
-            start_seq,
-            self._split_sentences,
-            self._extract_event_candidates,
-            self._extract_generic_memory_candidates,
-            llm_extractor,
-        )
+        previous_budget = getattr(self, "_extract_llm_sentence_budget", None)
+        if llm_extractor is not None:
+            self._extract_llm_sentence_budget = self.extract_llm_max_sentences_per_add
+        try:
+            return layer.build_passages(
+                request,
+                self._split_content,
+                start_seq,
+                self._split_sentences,
+                self._extract_event_candidates,
+                self._extract_generic_memory_candidates,
+                llm_extractor,
+            )
+        finally:
+            if previous_budget is None:
+                if hasattr(self, "_extract_llm_sentence_budget"):
+                    delattr(self, "_extract_llm_sentence_budget")
+            else:
+                self._extract_llm_sentence_budget = previous_budget
 
     def _llm_memory_extraction_ready(self) -> bool:
         return bool(
@@ -313,6 +344,22 @@ class LinearRAGMemoryService:
         sentences = payload.get("sentences") or []
         if not isinstance(sentences, list) or not sentences:
             return None
+        if self.enable_lightweight_llm_extraction:
+            sentences = self._select_llm_extraction_sentences(sentences)
+            if not sentences:
+                return None
+            budget = getattr(self, "_extract_llm_sentence_budget", -1)
+            if budget == 0:
+                return None
+            if budget > 0:
+                sentences = sentences[:budget]
+                self._extract_llm_sentence_budget = max(0, budget - len(sentences))
+            sentences = sorted(
+                sentences,
+                key=lambda item: self._sentence_original_index(item),
+            )
+        payload = dict(payload)
+        payload["sentences"] = sentences
 
         batch_size = max(1, self.extract_llm_batch_size)
         if len(sentences) > batch_size:
@@ -331,6 +378,68 @@ class LinearRAGMemoryService:
 
         return self._extract_llm_structured_memory_single(payload)
 
+    def _select_llm_extraction_sentences(self, sentences: list[Any]) -> list[Any]:
+        scored: list[tuple[float, int, Any]] = []
+        for position, sentence in enumerate(sentences):
+            text = self._sentence_text(sentence)
+            score = self._llm_extraction_sentence_score(text)
+            if score >= self.extract_llm_min_sentence_score:
+                scored.append((score, position, sentence))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [sentence for _score, _position, sentence in scored]
+
+    @staticmethod
+    def _sentence_text(sentence: Any) -> str:
+        if isinstance(sentence, dict):
+            return str(sentence.get("text") or "")
+        return str(sentence or "")
+
+    @staticmethod
+    def _sentence_original_index(sentence: Any) -> int:
+        if isinstance(sentence, dict):
+            try:
+                return int(sentence.get("sentence_index"))
+            except Exception:
+                return 0
+        return 0
+
+    @classmethod
+    def _llm_extraction_sentence_score(cls, text: str) -> float:
+        stripped = re.sub(r"\s+", " ", str(text or "").strip())
+        if not stripped:
+            return 0.0
+        lowered = stripped.lower()
+        tokens = re.findall(r"[a-z0-9][a-z0-9'_-]*", lowered)
+        if len(tokens) < 4:
+            return 0.0
+        if re.fullmatch(r"(?:hi|hello|hey|thanks|thank you|ok|okay|sure)[.! ]*", lowered):
+            return 0.0
+
+        score = 0.0
+        if re.search(r"\b(?:i|me|my|mine|we|our|ours|you|your|yours)\b", lowered):
+            score += 0.45
+        if re.search(r"\b(?:like|love|prefer|enjoy|hate|dislike|favorite|allergic|avoid|can't stand|cannot stand)\b", lowered):
+            score += 1.15
+        if re.search(r"\b(?:friend|wife|husband|partner|colleague|coworker|mother|father|parent|sister|brother|son|daughter|roommate|boss|teacher|student)\b", lowered):
+            score += 1.05
+        if re.search(r"\b(?:moved?|relocated|live|lived|born|grew up|work(?:ed|s)?|started|stopped|changed|switched|decided|visited|traveled|met|married|divorced|graduated|studied|learned|bought|sold|adopted|lost|won|joined|left)\b", lowered):
+            score += 1.10
+        if cls._has_time_expression(stripped) or cls._has_relative_time_expression(stripped):
+            score += 1.00
+        if re.search(r"\b(?:now|currently|recently|previously|before|after|since|until|again|no longer|not anymore|used to|latest|current)\b", lowered):
+            score += 0.85
+        if re.search(r"\b(?:plan|goal|want|need|trying|appointment|schedule|deadline|project|trip|vacation|meeting|interview|exam)\b", lowered):
+            score += 0.75
+        if re.search(r"\b(?:city|country|state|school|college|university|company|hospital|restaurant|home|office|seattle|sweden)\b", lowered):
+            score += 0.60
+        if re.search(r"\b[A-Z][a-z]{2,}\b", stripped):
+            score += 0.45
+        if len(tokens) > 60:
+            score -= 0.35
+        if "?" in stripped:
+            score -= 0.45
+        return max(0.0, score)
+
     def _extract_llm_structured_memory_single(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         url = self._chat_completions_url(self.extract_llm_base_url)
         system_prompt = (
@@ -348,7 +457,9 @@ class LinearRAGMemoryService:
             "markers, duration, current-state cues, and history cues. Do not convert relative time to absolute "
             "dates. message_timestamp is only ordering metadata, not semantic event time.\n\n"
             "Every extracted item must include sentence_index, evidence_text, and confidence. evidence_text must "
-            "be an exact substring of the corresponding sentence. Use empty arrays if nothing qualifies.\n\n"
+            "be an exact substring of the corresponding sentence. Only process the provided sentences. Use exactly "
+            "the sentence_index values from the input; do not renumber batched sentences. Use empty arrays if "
+            "nothing qualifies.\n\n"
             "Return this JSON schema exactly:\n"
             "{"
             "\"events\":[{\"sentence_index\":0,\"is_event\":true,\"event_worthiness\":0.0,"
