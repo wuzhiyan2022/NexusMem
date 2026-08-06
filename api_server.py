@@ -124,10 +124,14 @@ class LinearRAGMemoryService:
         self.structured_score_threshold = float(os.getenv("LINEARRAG_STRUCTURED_SCORE_THRESHOLD", "0.2"))
         self.rerank_candidate_multiplier = int(os.getenv("LINEARRAG_RERANK_CANDIDATE_MULTIPLIER", "3"))
         self.rerank_max_candidates = int(os.getenv("LINEARRAG_RERANK_MAX_CANDIDATES", "300"))
+        self.evidence_signal_weight = float(os.getenv("LINEARRAG_EVIDENCE_SIGNAL_WEIGHT", "2.25"))
         self.enable_evidence_completion = self._env_bool("LINEARRAG_ENABLE_EVIDENCE_COMPLETION", True)
         self.completion_anchor_top_n = int(os.getenv("LINEARRAG_COMPLETION_ANCHOR_TOP_N", "12"))
         self.completion_window = int(os.getenv("LINEARRAG_COMPLETION_WINDOW", "2"))
         self.completion_max_neighbors = int(os.getenv("LINEARRAG_COMPLETION_MAX_NEIGHBORS", "2"))
+        self.completion_related_top_n = int(os.getenv("LINEARRAG_COMPLETION_RELATED_TOP_N", "12"))
+        self.completion_max_related = int(os.getenv("LINEARRAG_COMPLETION_MAX_RELATED", "3"))
+        self.completion_min_related_fit = float(os.getenv("LINEARRAG_COMPLETION_MIN_RELATED_FIT", "0.24"))
         self.enable_search_debug = self._env_bool("LINEARRAG_ENABLE_SEARCH_DEBUG", False)
         self.search_debug_path = Path(
             os.getenv("LINEARRAG_SEARCH_DEBUG_PATH", str(self.root / "search_debug.jsonl"))
@@ -559,8 +563,9 @@ class LinearRAGMemoryService:
         temporal_context = self._temporal_context(passage_profiles.values())
         anchor_context = self._anchor_temporal_context(temporal_intent, ranked, passage_profiles)
 
+        max_base_score = max([abs(float(score)) for _, score in ranked] or [1.0]) or 1.0
         adjusted = []
-        for passage, score in ranked:
+        for rank_index, (passage, score) in enumerate(ranked, start=1):
             adjusted_score = score
             raw_id = MemoryLayer.parse_raw_id(passage)
             if raw_status:
@@ -568,6 +573,14 @@ class LinearRAGMemoryService:
                 adjusted_score = MemoryLayer.adjust_score(adjusted_score, status_info, intent)
             if self.enable_evidence_rerank:
                 temporal_profile = passage_profiles.get(passage, {})
+                evidence_signal = self._direct_evidence_score(
+                    query,
+                    options,
+                    passage,
+                    query_profile,
+                    temporal_intent,
+                    temporal_profile,
+                )
                 adjusted_score *= self._evidence_rerank_factor(
                     query,
                     options,
@@ -578,6 +591,9 @@ class LinearRAGMemoryService:
                     temporal_context,
                     anchor_context,
                 )
+                rank_prior = 1.0 / max(rank_index, 1) ** 0.35
+                adjusted_score += max_base_score * self.evidence_signal_weight * evidence_signal
+                adjusted_score += max_base_score * 0.08 * rank_prior
             adjusted.append((passage, adjusted_score))
         adjusted.sort(key=lambda item: item[1], reverse=True)
         adjusted = self._complete_neighbor_evidence(query_profile, adjusted, limit)
@@ -641,6 +657,127 @@ class LinearRAGMemoryService:
             anchor_context or {},
         )
         return max(0.65, min(2.05, factor))
+
+    def _direct_evidence_score(
+        self,
+        query: str,
+        options: list[str],
+        passage: str,
+        query_profile: dict[str, Any],
+        temporal_intent: dict[str, Any] | None,
+        temporal_profile: dict[str, Any] | None,
+    ) -> float:
+        metadata = self._passage_metadata(passage)
+        content = str(metadata.get("evidence_text") or self._strip_internal_prefix(passage))
+        content_lower = content.lower()
+        passage_tokens = self._rerank_tokens(content)
+        topic_tokens = set(query_profile.get("topic_tokens") or [])
+
+        score = 0.0
+        if topic_tokens and passage_tokens:
+            overlap = topic_tokens & passage_tokens
+            coverage = len(overlap) / max(len(topic_tokens), 1)
+            score += min(0.42, 0.08 * len(overlap) + 0.28 * coverage)
+        elif not topic_tokens:
+            score += 0.06
+
+        target_speakers = [
+            self._normalize_person_name(value)
+            for value in query_profile.get("target_speakers") or []
+            if self._normalize_person_name(value)
+        ]
+        if target_speakers:
+            speaker = self._normalize_person_name(metadata.get("speaker", ""))
+            if speaker in target_speakers:
+                score += 0.24
+            elif speaker:
+                score -= 0.10
+            elif any(target in content_lower for target in target_speakers):
+                score += 0.08
+
+        score += 0.24 * self._answer_type_signal(query_profile, content, metadata)
+
+        for phrase in self._important_phrases(query):
+            if phrase in content_lower:
+                score += 0.04
+
+        intent = temporal_intent or {}
+        for field, weight in (("target", 0.12), ("anchor_event", 0.08)):
+            value = str(intent.get(field) or "").strip()
+            if not value:
+                continue
+            target_tokens = self._rerank_tokens(value)
+            if target_tokens and passage_tokens:
+                coverage = len(target_tokens & passage_tokens) / max(len(target_tokens), 1)
+                score += weight * coverage
+            if len(value) > 4 and value.lower() in content_lower:
+                score += min(weight, 0.08)
+
+        if options:
+            score += min(0.10, self._best_option_match(options, passage_tokens, content_lower) * 0.6)
+
+        if temporal_profile:
+            if query_profile.get("answer_type") == "time" and temporal_profile.get("has_explicit_time"):
+                score += 0.06
+            if query_profile.get("answer_type") in {"time", "duration"} and temporal_profile.get("has_relative_time"):
+                score += 0.04
+
+        if query_profile.get("answer_type") == "time":
+            has_text_time = self._has_time_expression(content)
+            if has_text_time:
+                score += 0.12
+            elif metadata.get("memory_timestamp") or metadata.get("memory_time_iso") or metadata.get("session_time"):
+                score -= 0.04
+            if not has_text_time:
+                score *= 0.72
+
+        return max(0.0, min(1.0, score))
+
+    @classmethod
+    def _answer_type_signal(cls, query_profile: dict[str, Any], content: str, metadata: dict[str, Any]) -> float:
+        answer_type = str(query_profile.get("answer_type") or "generic")
+        lowered = str(content or "").lower()
+        if answer_type == "time":
+            signal = 0.0
+            has_text_time = cls._has_time_expression(content)
+            has_relative = cls._has_relative_time_expression(content)
+            has_structured_time = bool(
+                metadata.get("session_time")
+                or metadata.get("memory_timestamp")
+                or metadata.get("memory_time_iso")
+            )
+            if has_text_time:
+                signal += 0.80
+            if has_relative:
+                signal += 0.20
+            if has_structured_time:
+                signal += 0.10 if (has_text_time or has_relative) else 0.05
+            return min(1.0, signal)
+        if answer_type == "duration":
+            return 1.0 if re.search(r"\b(?:for|since)\b|\b\d+\s+(?:years?|months?|weeks?|days?|hours?)\b", lowered) else 0.0
+        if answer_type == "location":
+            return 1.0 if re.search(
+                r"\b(?:from|to|in|at|near|moved|move|home country|city|town|country|state|beach|mountains?|forest|sweden)\b",
+                lowered,
+            ) else 0.0
+        if answer_type == "reason":
+            return 1.0 if re.search(
+                r"\b(?:because|since|so that|due to|thanks to|as a result|made me|helped me|realized|learnt|learned)\b",
+                lowered,
+            ) else 0.0
+        if answer_type == "relation":
+            return 1.0 if re.search(
+                r"\b(?:single|married|wife|husband|partner|friend|family|colleague|parent|breakup|relationship|support)\b",
+                lowered,
+            ) else 0.0
+        if answer_type == "identity":
+            return 1.0 if re.search(
+                r"\b(?:identity|transgender|gay|lesbian|bisexual|queer|nonbinary|woman|man|parent|student|artist|writer)\b",
+                lowered,
+            ) else 0.0
+        if answer_type == "person":
+            return 1.0 if re.search(r"\b[A-Z][a-z]{2,}\b", str(content or "")) else 0.0
+        return 0.0
 
     @classmethod
     def _query_evidence_profile(cls, query: str, options: list[str]) -> dict[str, Any]:
@@ -747,12 +884,17 @@ class LinearRAGMemoryService:
         if answer_type == "time":
             has_text_time = cls._has_time_expression(content)
             has_relative = cls._has_relative_time_expression(content)
+            has_structured_time = bool(
+                metadata.get("session_time")
+                or metadata.get("memory_timestamp")
+                or metadata.get("memory_time_iso")
+            )
             if has_text_time:
-                factor += 0.12
-            if has_relative and metadata.get("session_time"):
+                factor += 0.18
+            if has_relative and has_structured_time:
                 factor += 0.08
-            if not has_text_time and not metadata.get("session_time"):
-                factor -= 0.05
+            if not has_text_time:
+                factor -= 0.10
         elif answer_type == "duration":
             if re.search(r"\b(?:for|since)\b|\b\d+\s+(?:years?|months?|weeks?|days?|hours?)\b", lowered):
                 factor += 0.14
@@ -783,45 +925,80 @@ class LinearRAGMemoryService:
         window = max(0, int(self.completion_window))
         anchor_top_n = max(0, int(self.completion_anchor_top_n))
         max_neighbors = max(0, int(self.completion_max_neighbors))
-        if window == 0 or anchor_top_n == 0 or max_neighbors == 0:
+        related_top_n = max(0, int(self.completion_related_top_n))
+        max_related = max(0, int(self.completion_max_related))
+        min_related_fit = max(0.0, float(self.completion_min_related_fit))
+        if anchor_top_n == 0 and related_top_n == 0:
             return ranked
 
         metadata_by_passage = {passage: self._passage_metadata(passage) for passage, _ in ranked}
         original_order = {passage: index for index, (passage, _) in enumerate(ranked)}
         boosted_scores = {passage: float(score) for passage, score in ranked}
-        anchors = ranked[: min(len(ranked), max(anchor_top_n, min(limit, anchor_top_n)))]
+        anchors = ranked[: min(len(ranked), max(anchor_top_n, min(limit, anchor_top_n)))] if anchor_top_n else []
 
-        for anchor_passage, anchor_score in anchors:
-            anchor_meta = metadata_by_passage.get(anchor_passage) or {}
-            anchor_session = str(anchor_meta.get("session_index") or "")
-            anchor_message = self._metadata_int(anchor_meta.get("message_index"))
-            if not anchor_session or anchor_message is None:
-                continue
+        if window > 0 and max_neighbors > 0:
+            for anchor_passage, anchor_score in anchors:
+                anchor_meta = metadata_by_passage.get(anchor_passage) or {}
+                anchor_session = str(anchor_meta.get("session_index") or "")
+                anchor_message = self._metadata_int(anchor_meta.get("message_index"))
+                if not anchor_session or anchor_message is None:
+                    continue
 
-            neighbors: list[tuple[int, float, str, float]] = []
-            for passage, score in ranked:
-                if passage == anchor_passage:
-                    continue
-                meta = metadata_by_passage.get(passage) or {}
-                if str(meta.get("session_index") or "") != anchor_session:
-                    continue
-                message_index = self._metadata_int(meta.get("message_index"))
-                if message_index is None:
-                    continue
-                distance = abs(message_index - anchor_message)
-                if distance < 1 or distance > window:
-                    continue
-                if not self._neighbor_speaker_allowed(query_profile, anchor_meta, meta):
-                    continue
-                fit = self._neighbor_fit_score(query_profile, meta)
-                neighbors.append((distance, -fit, passage, score))
+                neighbors: list[tuple[int, float, str, float]] = []
+                for passage, score in ranked:
+                    if passage == anchor_passage:
+                        continue
+                    meta = metadata_by_passage.get(passage) or {}
+                    if str(meta.get("session_index") or "") != anchor_session:
+                        continue
+                    message_index = self._metadata_int(meta.get("message_index"))
+                    if message_index is None:
+                        continue
+                    distance = abs(message_index - anchor_message)
+                    if distance < 1 or distance > window:
+                        continue
+                    if not self._neighbor_speaker_allowed(query_profile, anchor_meta, meta):
+                        continue
+                    fit = self._neighbor_fit_score(query_profile, meta)
+                    neighbors.append((distance, -fit, passage, score))
 
-            neighbors.sort(key=lambda item: (item[0], item[1], original_order.get(item[2], 0)))
-            for distance, negative_fit, passage, _score in neighbors[:max_neighbors]:
-                fit = -negative_fit
-                candidate_factor = 0.96 - 0.06 * distance + 0.04 * fit
-                candidate_factor = max(0.72, min(0.96, candidate_factor))
-                boosted_scores[passage] = max(boosted_scores[passage], float(anchor_score) * candidate_factor)
+                neighbors.sort(key=lambda item: (item[0], item[1], original_order.get(item[2], 0)))
+                for distance, negative_fit, passage, _score in neighbors[:max_neighbors]:
+                    fit = -negative_fit
+                    candidate_factor = 0.96 - 0.06 * distance + 0.04 * fit
+                    candidate_factor = max(0.72, min(0.96, candidate_factor))
+                    boosted_scores[passage] = max(boosted_scores[passage], float(anchor_score) * candidate_factor)
+
+        if related_top_n and max_related:
+            related_anchors = sorted(
+                ranked,
+                key=lambda item: (boosted_scores.get(item[0], item[1]), -original_order.get(item[0], 0)),
+                reverse=True,
+            )[: min(len(ranked), max(related_top_n, min(limit, related_top_n)))]
+            for anchor_passage, anchor_score in related_anchors:
+                anchor_meta = metadata_by_passage.get(anchor_passage) or {}
+                related_candidates: list[tuple[float, str, float]] = []
+                for passage, score in ranked:
+                    if passage == anchor_passage:
+                        continue
+                    meta = metadata_by_passage.get(passage) or {}
+                    if not self._neighbor_speaker_allowed(query_profile, anchor_meta, meta):
+                        continue
+                    fit = self._related_evidence_fit_score(query_profile, anchor_meta, meta)
+                    if fit < min_related_fit:
+                        continue
+                    same_session = bool(
+                        anchor_meta.get("session_index")
+                        and anchor_meta.get("session_index") == meta.get("session_index")
+                    )
+                    candidate_factor = 0.56 + 0.24 * fit + (0.06 if same_session else 0.0)
+                    candidate_factor = max(0.50, min(0.86, candidate_factor))
+                    candidate_score = max(float(score), float(anchor_score) * candidate_factor)
+                    related_candidates.append((-fit, passage, candidate_score))
+
+                related_candidates.sort(key=lambda item: (item[0], original_order.get(item[1], 0)))
+                for _negative_fit, passage, candidate_score in related_candidates[:max_related]:
+                    boosted_scores[passage] = max(boosted_scores[passage], candidate_score)
 
         ordered = sorted(
             ranked,
@@ -855,6 +1032,27 @@ class LinearRAGMemoryService:
         if not topic_tokens:
             return 0.0
         return len(topic_tokens & passage_tokens) / max(len(topic_tokens), 1)
+
+    @classmethod
+    def _related_evidence_fit_score(
+        cls,
+        query_profile: dict[str, Any],
+        anchor_meta: dict[str, Any],
+        candidate_meta: dict[str, Any],
+    ) -> float:
+        candidate_text = str(candidate_meta.get("evidence_text") or "")
+        anchor_text = str(anchor_meta.get("evidence_text") or "")
+        topic_tokens = set(query_profile.get("topic_tokens") or [])
+        candidate_tokens = cls._rerank_tokens(candidate_text)
+        anchor_tokens = cls._rerank_tokens(anchor_text)
+        topic_fit = 0.0
+        if topic_tokens:
+            topic_fit = len(topic_tokens & candidate_tokens) / max(len(topic_tokens), 1)
+        type_fit = cls._answer_type_signal(query_profile, candidate_text, candidate_meta)
+        shared_fit = 0.0
+        if anchor_tokens and candidate_tokens:
+            shared_fit = len(anchor_tokens & candidate_tokens) / max(min(len(anchor_tokens), len(candidate_tokens), 8), 1)
+        return max(0.0, min(1.0, 0.52 * topic_fit + 0.35 * type_fit + 0.13 * min(shared_fit, 1.0)))
 
     @staticmethod
     def _metadata_int(value: Any) -> int | None:
@@ -1262,6 +1460,7 @@ class LinearRAGMemoryService:
             "did", "does", "do", "was", "were", "is", "are", "am", "be", "been", "being",
             "to", "of", "in", "on", "at", "by", "from", "as", "a", "an", "or", "if", "then",
             "i", "me", "my", "mine", "we", "our", "ours", "you", "your", "yours", "user",
+            "he", "she", "him", "her", "his", "hers", "they", "them", "their", "theirs", "it", "its",
             "answer", "answers", "best", "match", "matches", "memory", "option", "first", "second",
             "third", "fourth", "following", "about", "tell", "ask", "asked", "said", "say",
             "would", "could", "should", "likely", "maybe", "probably", "possibly", "please",
@@ -1388,10 +1587,20 @@ class LinearRAGMemoryService:
     def _passage_metadata(cls, passage: str) -> dict[str, Any]:
         visible = cls._strip_internal_prefix(passage)
         metadata = {
+            "raw_id": MemoryLayer.parse_raw_id(passage) or "",
             "dia_id": cls._bracket_value(visible, "dia_id"),
-            "session_index": cls._bracket_value(visible, "session_index"),
-            "message_index": cls._bracket_value(visible, "message_index"),
+            "session_index": cls._bracket_value(visible, "session_index")
+            or cls._bracket_value(visible, "source_session_index"),
+            "message_index": cls._bracket_value(visible, "message_index")
+            or cls._bracket_value(visible, "source_message_index"),
             "session_time": cls._bracket_value(visible, "session_time"),
+            "memory_timestamp": cls._bracket_value(visible, "memory_timestamp"),
+            "memory_time_iso": cls._bracket_value(visible, "memory_time_iso"),
+            "order_index": cls._bracket_value(visible, "order_index"),
+            "session_id": cls._bracket_value(visible, "session_id"),
+            "request_id": cls._bracket_value(visible, "request_id"),
+            "source_session_index": cls._bracket_value(visible, "source_session_index"),
+            "source_message_index": cls._bracket_value(visible, "source_message_index"),
             "speaker": "",
             "evidence_text": "",
         }

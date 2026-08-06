@@ -5,6 +5,7 @@ import json
 import re
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -268,8 +269,9 @@ class MemoryLayer:
             ]
 
             header = " ".join(header_parts)
+            visible_header = self._visible_metadata_header(raw)
             speaker = raw.get("speaker") or raw["role"]
-            passages.append(f"{seq}:{header}\n{speaker}: {raw['content']}")
+            passages.append(f"{seq}:{header}\n{visible_header}\n{speaker}: {raw['content']}")
             seq += 1
         return passages
 
@@ -377,6 +379,41 @@ class MemoryLayer:
     @classmethod
     def _speaker_from_content(cls, content: str) -> str:
         return cls._content_metadata(content).get("speaker", "")
+
+    @staticmethod
+    def _visible_metadata_header(raw: dict[str, Any]) -> str:
+        timestamp = raw.get("timestamp", "")
+        parts = [
+            f"[memory_timestamp={timestamp}]",
+            f"[order_index={raw.get('order_index', '')}]",
+            f"[session_id={raw.get('session_id', '')}]",
+            f"[request_id={raw.get('request_id', '')}]",
+        ]
+        timestamp_iso = MemoryLayer._timestamp_iso(timestamp)
+        if timestamp_iso:
+            parts.append(f"[memory_time_iso={timestamp_iso}]")
+        if raw.get("dia_id"):
+            parts.append(f"[dia_id={raw.get('dia_id', '')}]")
+        if raw.get("source_session_index"):
+            parts.append(f"[source_session_index={raw.get('source_session_index', '')}]")
+        if raw.get("source_message_index"):
+            parts.append(f"[source_message_index={raw.get('source_message_index', '')}]")
+        return " ".join(parts)
+
+    @staticmethod
+    def _timestamp_iso(value: Any) -> str:
+        try:
+            timestamp = float(str(value).strip())
+        except Exception:
+            return ""
+        if timestamp <= 0:
+            return ""
+        if timestamp > 100000000000:
+            timestamp /= 1000.0
+        try:
+            return datetime.fromtimestamp(timestamp, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return ""
 
     @staticmethod
     def _content_metadata(content: str) -> dict[str, str]:
