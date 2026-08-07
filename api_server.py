@@ -83,7 +83,8 @@ class LinearRAGMemoryService:
         self.root = Path(os.getenv("LINEARRAG_STORAGE_DIR", "import_api")).resolve()
         self.users_root = self.root / "users"
         self.embedding_model_path = os.getenv("LINEARRAG_EMBEDDING_MODEL", "model/all-mpnet-base-v2")
-        self.spacy_model_name = os.getenv("LINEARRAG_SPACY_MODEL", "en_core_web_trf")
+        self.spacy_model_name = os.getenv("LINEARRAG_SPACY_MODEL", "en_core_web_sm")
+        self.spacy_fallback_model_name = os.getenv("LINEARRAG_SPACY_FALLBACK_MODEL", "en_core_web_trf")
         self.batch_size = int(os.getenv("LINEARRAG_BATCH_SIZE", "64"))
         self.max_workers = int(os.getenv("LINEARRAG_MAX_WORKERS", "4"))
         self.max_chunk_chars = int(os.getenv("LINEARRAG_MAX_CHUNK_CHARS", "3500"))
@@ -99,7 +100,7 @@ class LinearRAGMemoryService:
         self.memory_sidecar_top_k = int(os.getenv("LINEARRAG_MEMORY_SIDECAR_TOP_K", "16"))
         self.memory_sidecar_weight = float(os.getenv("LINEARRAG_MEMORY_SIDECAR_WEIGHT", "1.15"))
         self.memory_sidecar_min_fit = float(os.getenv("LINEARRAG_MEMORY_SIDECAR_MIN_FIT", "0.22"))
-        self.enable_llm_query_intent = self._env_bool("LINEARRAG_ENABLE_LLM_QUERY_INTENT", True)
+        self.enable_llm_query_intent = self._env_bool("LINEARRAG_ENABLE_LLM_QUERY_INTENT", False)
         self.query_llm_model = os.getenv("LINEARRAG_QUERY_LLM_MODEL", "gpt-4o-mini").strip()
         self.query_llm_base_url = (
             os.getenv("LINEARRAG_QUERY_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or ""
@@ -108,7 +109,7 @@ class LinearRAGMemoryService:
             os.getenv("LINEARRAG_QUERY_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
         ).strip()
         self.query_llm_timeout = float(os.getenv("LINEARRAG_QUERY_LLM_TIMEOUT", "4"))
-        self.enable_llm_memory_extraction = self._env_bool("LINEARRAG_ENABLE_LLM_MEMORY_EXTRACTION", True)
+        self.enable_llm_memory_extraction = self._env_bool("LINEARRAG_ENABLE_LLM_MEMORY_EXTRACTION", False)
         self.extract_llm_model = os.getenv("LINEARRAG_EXTRACT_LLM_MODEL", self.query_llm_model).strip()
         self.extract_llm_base_url = (
             os.getenv("LINEARRAG_EXTRACT_LLM_BASE_URL") or self.query_llm_base_url
@@ -116,7 +117,7 @@ class LinearRAGMemoryService:
         self.extract_llm_api_key = (
             os.getenv("LINEARRAG_EXTRACT_LLM_API_KEY") or self.query_llm_api_key
         ).strip()
-        self.enable_lightweight_llm_extraction = self._env_bool("LINEARRAG_ENABLE_LIGHTWEIGHT_LLM_EXTRACTION", True)
+        self.enable_lightweight_llm_extraction = self._env_bool("LINEARRAG_ENABLE_LIGHTWEIGHT_LLM_EXTRACTION", False)
         self.extract_llm_timeout = float(os.getenv("LINEARRAG_EXTRACT_LLM_TIMEOUT", "2.0"))
         self.extract_llm_batch_size = int(os.getenv("LINEARRAG_EXTRACT_LLM_BATCH_SIZE", "8"))
         self.extract_llm_max_tokens = int(os.getenv("LINEARRAG_EXTRACT_LLM_MAX_TOKENS", "900"))
@@ -150,6 +151,36 @@ class LinearRAGMemoryService:
         self.rerank_candidate_multiplier = int(os.getenv("LINEARRAG_RERANK_CANDIDATE_MULTIPLIER", "3"))
         self.rerank_max_candidates = int(os.getenv("LINEARRAG_RERANK_MAX_CANDIDATES", "300"))
         self.evidence_signal_weight = float(os.getenv("LINEARRAG_EVIDENCE_SIGNAL_WEIGHT", "2.25"))
+        self.enable_cross_encoder_rerank = self._env_bool("LINEARRAG_ENABLE_CROSS_ENCODER_RERANK", True)
+        self.cross_encoder_model_path = os.getenv(
+            "LINEARRAG_CROSS_ENCODER_MODEL",
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        ).strip()
+        self.cross_encoder_top_n = int(os.getenv("LINEARRAG_CROSS_ENCODER_TOP_N", "80"))
+        self.cross_encoder_weight = float(os.getenv("LINEARRAG_CROSS_ENCODER_WEIGHT", "0.90"))
+        self.cross_encoder_batch_size = int(os.getenv("LINEARRAG_CROSS_ENCODER_BATCH_SIZE", "32"))
+        self.enable_llm_rerank = self._env_bool("LINEARRAG_ENABLE_LLM_RERANK", True)
+        self.llm_rerank_model = os.getenv("LINEARRAG_RERANK_LLM_MODEL", self.query_llm_model).strip()
+        self.llm_rerank_base_url = (
+            os.getenv("LINEARRAG_RERANK_LLM_BASE_URL") or self.query_llm_base_url
+        ).strip().rstrip("/")
+        self.llm_rerank_api_key = (
+            os.getenv("LINEARRAG_RERANK_LLM_API_KEY") or self.query_llm_api_key
+        ).strip()
+        self.llm_rerank_top_n = int(os.getenv("LINEARRAG_LLM_RERANK_TOP_N", "30"))
+        self.llm_rerank_timeout = float(os.getenv("LINEARRAG_LLM_RERANK_TIMEOUT", "6"))
+        self.llm_rerank_max_tokens = int(os.getenv("LINEARRAG_LLM_RERANK_MAX_TOKENS", "700"))
+        self.llm_rerank_weight = float(os.getenv("LINEARRAG_LLM_RERANK_WEIGHT", "1.10"))
+        self.enable_query_expansion = self._env_bool("LINEARRAG_ENABLE_QUERY_EXPANSION", True)
+        self.query_expansion_top_k = int(os.getenv("LINEARRAG_QUERY_EXPANSION_TOP_K", "80"))
+        self.query_expansion_max_queries = int(os.getenv("LINEARRAG_QUERY_EXPANSION_MAX_QUERIES", "4"))
+        self.enable_answer_head_rerank = self._env_bool("LINEARRAG_ENABLE_ANSWER_HEAD_RERANK", True)
+        self.answer_head_k = int(os.getenv("LINEARRAG_ANSWER_HEAD_K", "12"))
+        self.answer_head_pool = int(os.getenv("LINEARRAG_ANSWER_HEAD_POOL", "80"))
+        self.enable_memory_evidence_return = self._env_bool("LINEARRAG_ENABLE_MEMORY_EVIDENCE_RETURN", True)
+        self.memory_evidence_top_k = int(os.getenv("LINEARRAG_MEMORY_EVIDENCE_TOP_K", "8"))
+        self.memory_evidence_weight = float(os.getenv("LINEARRAG_MEMORY_EVIDENCE_WEIGHT", "0.92"))
+        self.temporal_match_weight = float(os.getenv("LINEARRAG_TEMPORAL_MATCH_WEIGHT", "0.55"))
         self.enable_evidence_completion = self._env_bool("LINEARRAG_ENABLE_EVIDENCE_COMPLETION", True)
         self.completion_anchor_top_n = int(os.getenv("LINEARRAG_COMPLETION_ANCHOR_TOP_N", "12"))
         self.completion_window = int(os.getenv("LINEARRAG_COMPLETION_WINDOW", "2"))
@@ -161,15 +192,18 @@ class LinearRAGMemoryService:
         self.search_debug_path = Path(
             os.getenv("LINEARRAG_SEARCH_DEBUG_PATH", str(self.root / "search_debug.jsonl"))
         ).resolve()
+        self.graphml_write_interval = int(os.getenv("LINEARRAG_GRAPHML_WRITE_INTERVAL", "5"))
 
         self.users_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.rag_cache: OrderedDict[str, LinearRAG] = OrderedDict()
         self.query_intent_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self.cross_encoder_model: Any | None = None
+        self.cross_encoder_unavailable = False
 
         device = os.getenv("LINEARRAG_DEVICE") or self._default_device()
         self.embedding_model = SentenceTransformer(self.embedding_model_path, device=device)
-        self.spacy_ner = SpacyNER(self.spacy_model_name)
+        self.spacy_ner = self._load_spacy_ner()
 
     @staticmethod
     def _optional_float(value: str | None) -> float | None:
@@ -193,6 +227,15 @@ class LinearRAGMemoryService:
         except Exception:
             return "cpu"
 
+    def _load_spacy_ner(self) -> SpacyNER:
+        try:
+            return SpacyNER(self.spacy_model_name)
+        except Exception:
+            if not self.spacy_fallback_model_name or self.spacy_fallback_model_name == self.spacy_model_name:
+                raise
+            self.spacy_model_name = self.spacy_fallback_model_name
+            return SpacyNER(self.spacy_model_name)
+
     def add(self, request: AddRequest) -> dict[str, Any]:
         with self.lock:
             user_key = self._user_key(request.user_id)
@@ -203,10 +246,12 @@ class LinearRAGMemoryService:
 
             passages = self._build_passages_for_index(user_key, request, int(meta.get("next_seq", 0)))
             if passages:
-                rag = self._new_rag(user_key)
-                rag.index(passages)
+                rag = self._get_or_create_rag_for_add(user_key)
+                index_update_count = int(meta.get("index_update_count", 0)) + 1
+                rag.index(passages, write_graphml=self._should_write_graphml(index_update_count))
                 self._put_cached_rag(user_key, rag)
                 meta["next_seq"] = int(meta.get("next_seq", 0)) + len(passages)
+                meta["index_update_count"] = index_update_count
 
             processed[request.request_id] = {
                 "session_id": request.session_id,
@@ -233,6 +278,14 @@ class LinearRAGMemoryService:
             results = rag.retrieve([{"question": query, "answer": ""}])[0]
             passages = results.get("sorted_passage", [])
             scores = results.get("sorted_passage_scores", [])
+            passages, scores = self._merge_expanded_retrieval(
+                rag,
+                raw_query,
+                request.options or [],
+                passages,
+                scores,
+                retrieve_limit,
+            )
 
             if self.min_score is not None and scores and max(scores) < self.min_score:
                 return {"data": []}
@@ -240,6 +293,7 @@ class LinearRAGMemoryService:
             data = []
             seen_ids: set[str] = set()
             all_passages_by_raw_id = self._all_passages_by_raw_id(rag)
+            return_temporal_profiles = self._load_raw_temporal_profiles(user_key)
             ranked_results = self._rank_search_results(
                 user_key,
                 raw_query,
@@ -248,6 +302,22 @@ class LinearRAGMemoryService:
                 scores,
                 limit,
                 all_passages_by_raw_id,
+            )
+            ranked_results = self._append_memory_evidence_results(
+                user_key,
+                raw_query,
+                request.options or [],
+                ranked_results,
+                all_passages_by_raw_id,
+                return_temporal_profiles,
+                limit,
+            )
+            ranked_results = self._promote_answer_head(
+                raw_query,
+                request.options or [],
+                ranked_results,
+                return_temporal_profiles,
+                limit,
             )
             for passage, score in ranked_results:
                 memory_id = rag.passage_embedding_store.text_to_hash_id.get(passage)
@@ -259,7 +329,11 @@ class LinearRAGMemoryService:
                 data.append(
                     {
                         "id": memory_id,
-                        "content": self._strip_internal_prefix(passage),
+                        "content": self._format_search_content(
+                            raw_query,
+                            passage,
+                            return_temporal_profiles.get(MemoryLayer.parse_raw_id(passage) or "", {}),
+                        ),
                         "score": float(score),
                     }
                 )
@@ -595,6 +669,7 @@ class LinearRAGMemoryService:
             dataset_name=user_key,
             embedding_model=self.embedding_model,
             spacy_model=self.spacy_model_name,
+            spacy_fallback_model=self.spacy_fallback_model_name,
             working_dir=str(self.users_root),
             batch_size=self.batch_size,
             max_workers=self.max_workers,
@@ -608,9 +683,23 @@ class LinearRAGMemoryService:
             structured_memory_weight=self.structured_memory_weight,
             structured_time_weight=self.structured_time_weight,
             structured_score_threshold=self.structured_score_threshold,
+            graphml_write_interval=self.graphml_write_interval,
         )
         config.spacy_ner = self.spacy_ner
         return LinearRAG(config)
+
+    def _get_or_create_rag_for_add(self, user_key: str) -> LinearRAG:
+        cached = self.rag_cache.get(user_key)
+        if cached is not None:
+            self.rag_cache.move_to_end(user_key)
+            return cached
+        return self._new_rag(user_key)
+
+    def _should_write_graphml(self, index_update_count: int) -> bool:
+        interval = max(0, self.graphml_write_interval)
+        if interval == 0:
+            return False
+        return index_update_count % interval == 0
 
     def _get_rag(self, user_key: str) -> LinearRAG | None:
         cached = self.rag_cache.get(user_key)
@@ -623,7 +712,7 @@ class LinearRAGMemoryService:
             return None
         rag = self._new_rag(user_key)
         if rag.passage_embedding_store.texts:
-            rag.index(rag.passage_embedding_store.texts)
+            rag.index(rag.passage_embedding_store.texts, write_graphml=False)
         self._put_cached_rag(user_key, rag)
         return rag
 
@@ -659,6 +748,109 @@ class LinearRAGMemoryService:
         multiplier = max(1, self.rerank_candidate_multiplier)
         max_candidates = max(limit, self.rerank_max_candidates)
         return min(max_candidates, max(limit, limit * multiplier))
+
+    def _merge_expanded_retrieval(
+        self,
+        rag: LinearRAG,
+        query: str,
+        options: list[str],
+        passages: list[str],
+        scores: list[float],
+        retrieve_limit: int,
+    ) -> tuple[list[str], list[float]]:
+        expanded_queries = self._expanded_search_queries(query, options)
+        if not expanded_queries:
+            return passages, scores
+
+        merged: OrderedDict[str, float] = OrderedDict()
+        for passage, score in zip(passages, scores):
+            merged[passage] = max(merged.get(passage, float("-inf")), float(score))
+
+        old_top_k = rag.config.retrieval_top_k
+        rag.config.retrieval_top_k = max(1, min(int(self.query_expansion_top_k), max(int(retrieve_limit), 1)))
+        try:
+            for query_index, expanded_query in enumerate(expanded_queries):
+                try:
+                    result = rag.retrieve([{"question": expanded_query, "answer": ""}])[0]
+                except Exception:
+                    continue
+                expansion_weight = max(0.72, 0.92 - 0.04 * query_index)
+                for passage, score in zip(
+                    result.get("sorted_passage", []) or [],
+                    result.get("sorted_passage_scores", []) or [],
+                ):
+                    adjusted_score = float(score) * expansion_weight
+                    if passage not in merged:
+                        merged[passage] = adjusted_score
+                    else:
+                        merged[passage] = max(merged[passage], adjusted_score)
+        finally:
+            rag.config.retrieval_top_k = old_top_k
+
+        sorted_items = sorted(merged.items(), key=lambda item: item[1], reverse=True)
+        max_keep = max(int(retrieve_limit), min(len(sorted_items), int(self.rerank_max_candidates)))
+        sorted_items = sorted_items[:max_keep]
+        return [passage for passage, _ in sorted_items], [score for _, score in sorted_items]
+
+    def _expanded_search_queries(self, query: str, options: list[str]) -> list[str]:
+        if not self.enable_query_expansion:
+            return []
+        text = re.sub(r"\s+", " ", str(query or "").strip())
+        lowered = text.lower()
+        if not text:
+            return []
+
+        should_expand = bool(
+            re.search(r"\bwhich\b|\bhow many\b|\bhow much\b|\bcount\b|\bboth\b|\ball\b|\btimes?\b", lowered)
+        )
+        if not should_expand:
+            return []
+
+        names = [
+            match.group(1)
+            for match in re.finditer(r"\b([A-Z][a-z][A-Za-z']{1,})(?:'s)?\b", text)
+            if match.group(1).lower()
+            not in {
+                "What", "When", "Where", "Who", "Why", "How", "Which", "Would",
+                "Could", "Should", "Can", "Does", "Did", "Is", "Are",
+                "January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December",
+            }
+        ]
+        names = [name for index, name in enumerate(names) if name not in names[:index]]
+
+        topic = re.sub(r"^\s*(?:which|what|how many|how much|where|who|when)\b", "", text, flags=re.IGNORECASE)
+        topic = re.sub(r"\b(?:have|has|did|does|do|would|could|should|is|are|was|were|both|all|the|a|an)\b", " ", topic, flags=re.IGNORECASE)
+        for name in names:
+            topic = re.sub(rf"\b{re.escape(name)}(?:'s)?\b", " ", topic)
+        topic = re.sub(r"[^A-Za-z0-9 ]+", " ", topic)
+        topic = re.sub(r"\s+", " ", topic).strip()
+
+        queries: list[str] = []
+        for name in names[:3]:
+            if topic:
+                queries.append(f"{name} {topic}")
+            if re.search(r"\bvisited|visit|cities?|city|where\b", lowered):
+                queries.append(f"{name} visited city place travel")
+            if re.search(r"\bhow many\b|\btimes?\b|\bcount\b", lowered):
+                queries.append(f"{name} {topic} times count")
+        if re.search(r"\bwhich\b", lowered) and topic:
+            queries.append(topic)
+        for option in options or []:
+            option_text = str(option).strip()
+            if option_text:
+                queries.append(f"{text} {option_text}")
+
+        cleaned: list[str] = []
+        for item in queries:
+            item = re.sub(r"\s+", " ", item).strip()
+            if len(item) < 3 or item.lower() == lowered:
+                continue
+            if item not in cleaned:
+                cleaned.append(item)
+            if len(cleaned) >= max(0, int(self.query_expansion_max_queries)):
+                break
+        return cleaned
 
     def _rank_search_results(
         self,
@@ -736,6 +928,12 @@ class LinearRAGMemoryService:
                     temporal_intent,
                     temporal_profile,
                 )
+                temporal_match = self._temporal_match_score(
+                    query,
+                    temporal_intent,
+                    temporal_profile,
+                    passage,
+                )
                 adjusted_score *= self._evidence_rerank_factor(
                     query,
                     options,
@@ -748,8 +946,31 @@ class LinearRAGMemoryService:
                 )
                 rank_prior = 1.0 / max(rank_index, 1) ** 0.35
                 adjusted_score += max_base_score * self.evidence_signal_weight * evidence_signal
+                adjusted_score += max_base_score * self.temporal_match_weight * temporal_match
                 adjusted_score += max_base_score * 0.08 * rank_prior
             adjusted.append((passage, adjusted_score))
+        rerank_scores: dict[str, float] = {}
+        rerank_weight = 0.0
+        if self.enable_cross_encoder_rerank:
+            rerank_scores = self._cross_encoder_rerank_scores(query, adjusted)
+            rerank_weight = self.cross_encoder_weight if rerank_scores else 0.0
+        if not rerank_scores and self.enable_llm_rerank:
+            rerank_scores = self._llm_rerank_scores(
+                query,
+                options,
+                temporal_intent,
+                adjusted,
+                passage_profiles,
+            )
+            rerank_weight = self.llm_rerank_weight if rerank_scores else 0.0
+        if rerank_scores and rerank_weight > 0.0:
+            adjusted = [
+                (
+                    passage,
+                    score + max_base_score * rerank_weight * rerank_scores.get(passage, 0.0),
+                )
+                for passage, score in adjusted
+            ]
         if memory_sidecar_raw_boosts and all_passages_by_raw_id:
             adjusted = self._append_sidecar_evidence(
                 adjusted,
@@ -811,6 +1032,377 @@ class LinearRAGMemoryService:
                 added += 1
                 break
         return expanded
+
+    def _append_memory_evidence_results(
+        self,
+        user_key: str,
+        query: str,
+        options: list[str],
+        ranked: list[tuple[str, float]],
+        all_passages_by_raw_id: dict[str, list[str]],
+        raw_temporal_profiles: dict[str, dict[str, Any]],
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        if not self.enable_memory_evidence_return or not self.enable_memory_layer:
+            return ranked
+        try:
+            layer = MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars)
+            memories = layer.load_consolidated_memories()
+        except Exception:
+            return ranked
+        if not memories:
+            return ranked
+
+        query_profile = self._query_evidence_profile(query, options)
+        temporal_intent = self._query_temporal_intent(query)
+        intent = MemoryLayer.query_intent(query)
+        matches = self._match_sidecar_memories(memories, query, query_profile, intent, temporal_intent)
+        if not matches:
+            return ranked
+
+        memory_by_id = {
+            str(memory.get("memory_id") or ""): memory
+            for memory in memories
+            if isinstance(memory, dict) and str(memory.get("memory_id") or "")
+        }
+        max_score = max([abs(float(score)) for _, score in ranked] or [1.0]) or 1.0
+        seen_passages = {passage for passage, _ in ranked}
+        added = 0
+        expanded = list(ranked)
+        for match in matches:
+            if added >= max(0, int(self.memory_evidence_top_k)):
+                break
+            memory = memory_by_id.get(str(match.get("memory_id") or ""))
+            if not memory:
+                continue
+            status = str(memory.get("status") or "active").lower()
+            if status not in {"active", "conflicting"} and MemoryLayer.query_intent(query) != "history":
+                continue
+            raw_ids = [str(raw_id) for raw_id in memory.get("evidence_raw_ids") or [] if str(raw_id)]
+            source_passage = ""
+            source_raw_id = ""
+            for raw_id in raw_ids:
+                source_candidates = all_passages_by_raw_id.get(raw_id) or []
+                if source_candidates:
+                    source_passage = source_candidates[0]
+                    source_raw_id = raw_id
+                    break
+            memory_passage = self._memory_evidence_passage(memory, source_passage, raw_temporal_profiles.get(source_raw_id, {}))
+            if not memory_passage or memory_passage in seen_passages:
+                continue
+            score = max_score * self.memory_evidence_weight * max(0.35, min(1.0, float(match.get("score") or 0.0)))
+            expanded.append((memory_passage, score))
+            seen_passages.add(memory_passage)
+            added += 1
+        return expanded
+
+    def _memory_evidence_passage(
+        self,
+        memory: dict[str, Any],
+        source_passage: str,
+        temporal_profile: dict[str, Any],
+    ) -> str:
+        memory_id = str(memory.get("memory_id") or "")
+        if not memory_id:
+            return ""
+        status = str(memory.get("status") or "active")
+        subject = str(memory.get("subject") or "").strip()
+        predicate = str(memory.get("predicate") or "").strip().replace("_", " ")
+        obj = str(memory.get("object") or "").strip()
+        source_text = str(memory.get("source_text") or "").strip()
+        structured = " ".join(part for part in (subject, predicate, obj) if part).strip()
+        if structured:
+            memory_sentence = structured
+        else:
+            memory_sentence = source_text
+        if not memory_sentence:
+            return ""
+
+        source_clean = self._clean_search_content(source_passage) if source_passage else source_text
+        note = self._temporal_evidence_note(temporal_profile or {})
+        parts = [
+            f"[memory_evidence_id={memory_id}]",
+            f"[memory_status={status}]",
+            f"Memory evidence: {memory_sentence}.",
+        ]
+        if note:
+            parts.append(note)
+        if source_clean and source_clean.lower() != memory_sentence.lower():
+            parts.append(f"Source evidence: {source_clean}")
+        return "\n".join(parts).strip()
+
+    def _promote_answer_head(
+        self,
+        query: str,
+        options: list[str],
+        ranked: list[tuple[str, float]],
+        raw_temporal_profiles: dict[str, dict[str, Any]],
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        if not self.enable_answer_head_rerank or not ranked:
+            return ranked
+        head_k = min(max(0, int(self.answer_head_k)), max(int(limit), 0), len(ranked))
+        if head_k <= 1:
+            return ranked
+
+        pool_size = min(max(head_k, int(self.answer_head_pool)), len(ranked))
+        pool = ranked[:pool_size]
+        tail = ranked[pool_size:]
+        query_profile = self._query_evidence_profile(query, options)
+        temporal_intent = self._query_temporal_intent(query)
+        max_score = max([abs(float(score)) for _, score in ranked] or [1.0]) or 1.0
+
+        scored_pool: list[tuple[str, float, set[str], str]] = []
+        for rank_index, (passage, score) in enumerate(pool, start=1):
+            raw_id = MemoryLayer.parse_raw_id(passage) or ""
+            temporal_profile = raw_temporal_profiles.get(raw_id, {})
+            clean_content = self._format_search_content(query, passage, temporal_profile)
+            tokens = self._rerank_tokens(clean_content)
+            direct = self._direct_evidence_score(
+                query,
+                options,
+                passage,
+                query_profile,
+                temporal_intent,
+                temporal_profile,
+            )
+            temporal = self._temporal_match_score(query, temporal_intent, temporal_profile, passage)
+            metadata_penalty = self._metadata_noise_penalty(clean_content)
+            memory_bonus = 0.18 if "[memory_evidence_id=" in passage else 0.0
+            length_bonus = self._answer_context_length_bonus(clean_content)
+            rank_prior = 1.0 / max(rank_index, 1) ** 0.35
+            normalized_score = float(score) / max_score
+            head_score = (
+                0.30 * normalized_score
+                + 0.32 * direct
+                + 0.16 * temporal
+                + 0.10 * rank_prior
+                + 0.08 * length_bonus
+                + memory_bonus
+                - metadata_penalty
+            )
+            scored_pool.append((passage, head_score, tokens, raw_id))
+
+        selected: list[tuple[str, float]] = []
+        selected_passages: set[str] = set()
+        selected_raw_ids: set[str] = set()
+        selected_tokens: list[set[str]] = []
+        while len(selected) < head_k and scored_pool:
+            best_index = 0
+            best_score = float("-inf")
+            for index, (passage, score, tokens, raw_id) in enumerate(scored_pool):
+                diversity_penalty = 0.0
+                if raw_id and raw_id in selected_raw_ids:
+                    diversity_penalty += 0.25
+                if selected_tokens and tokens:
+                    max_overlap = max(
+                        len(tokens & existing) / max(len(tokens | existing), 1)
+                        for existing in selected_tokens
+                        if existing
+                    )
+                    diversity_penalty += min(0.22, max_overlap * 0.35)
+                candidate_score = score - diversity_penalty
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_index = index
+            passage, _score, tokens, raw_id = scored_pool.pop(best_index)
+            selected.append((passage, dict(ranked).get(passage, _score)))
+            selected_passages.add(passage)
+            if raw_id:
+                selected_raw_ids.add(raw_id)
+            selected_tokens.append(tokens)
+
+        remaining = [(passage, score) for passage, score in ranked if passage not in selected_passages]
+        return selected + remaining
+
+    @staticmethod
+    def _metadata_noise_penalty(content: str) -> float:
+        bracket_count = len(re.findall(r"\[[a-zA-Z_]+=", str(content or "")))
+        return min(0.18, 0.035 * bracket_count)
+
+    @staticmethod
+    def _answer_context_length_bonus(content: str) -> float:
+        length = len(str(content or ""))
+        if 80 <= length <= 900:
+            return 1.0
+        if length < 80:
+            return 0.35
+        if length <= 1600:
+            return 0.70
+        return 0.35
+
+    def _cross_encoder_rerank_scores(
+        self,
+        query: str,
+        ranked: list[tuple[str, float]],
+    ) -> dict[str, float]:
+        if not ranked or not self.cross_encoder_model_path or self.cross_encoder_unavailable:
+            return {}
+        model = self._get_cross_encoder_model()
+        if model is None:
+            return {}
+        candidates = ranked[: max(0, int(self.cross_encoder_top_n))]
+        if not candidates:
+            return {}
+        pairs = [
+            [query, self._strip_internal_prefix(passage)[:1800]]
+            for passage, _score in candidates
+        ]
+        try:
+            raw_scores = model.predict(
+                pairs,
+                batch_size=max(1, int(self.cross_encoder_batch_size)),
+                show_progress_bar=False,
+            )
+        except Exception:
+            self.cross_encoder_unavailable = True
+            return {}
+
+        values = [float(value) for value in raw_scores]
+        if not values:
+            return {}
+        min_value = min(values)
+        max_value = max(values)
+        normalized: list[float] = []
+        if max_value > min_value:
+            normalized = [(value - min_value) / (max_value - min_value) for value in values]
+        else:
+            normalized = [self._sigmoid(value) for value in values]
+        return {
+            passage: max(0.0, min(1.0, score))
+            for (passage, _base_score), score in zip(candidates, normalized)
+        }
+
+    def _llm_rerank_scores(
+        self,
+        query: str,
+        options: list[str],
+        temporal_intent: dict[str, Any],
+        ranked: list[tuple[str, float]],
+        passage_profiles: dict[str, dict[str, Any]],
+    ) -> dict[str, float]:
+        if not ranked or not self.llm_rerank_base_url or not self.llm_rerank_api_key or not self.llm_rerank_model:
+            return {}
+
+        candidates = ranked[: max(0, int(self.llm_rerank_top_n))]
+        if not candidates:
+            return {}
+
+        id_to_passage: dict[str, str] = {}
+        candidate_payload: list[dict[str, Any]] = []
+        for index, (passage, base_score) in enumerate(candidates, start=1):
+            candidate_id = f"c{index}"
+            id_to_passage[candidate_id] = passage
+            profile = passage_profiles.get(passage, {})
+            candidate_payload.append(
+                {
+                    "id": candidate_id,
+                    "base_rank": index,
+                    "base_score": round(float(base_score), 6),
+                    "temporal_evidence": self._temporal_resolution_summary(profile),
+                    "passage": self._clean_search_content(passage)[:900],
+                }
+            )
+
+        system_prompt = (
+            "You are a reranker for long-term memory retrieval. Rank candidate passages by "
+            "whether they contain direct evidence needed to answer the query. Prefer direct "
+            "evidence over topical similarity. For time/date questions, prefer passages where "
+            "the event and the time expression are connected, including resolved relative dates. "
+            "For multi-evidence questions, keep complementary evidence high. Return JSON only "
+            "with keys ranked_ids and scores. ranked_ids must be candidate ids such as c1."
+        )
+        payload = {
+            "model": self.llm_rerank_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "query": query,
+                            "options": options or [],
+                            "temporal_intent": temporal_intent or {},
+                            "candidates": candidate_payload,
+                            "output_format": {
+                                "ranked_ids": ["c1", "c2"],
+                                "scores": {"c1": 1.0, "c2": 0.8},
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": max(120, int(self.llm_rerank_max_tokens)),
+        }
+        request = urllib.request.Request(
+            self._chat_completions_url(self.llm_rerank_base_url),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.llm_rerank_api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.llm_rerank_timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+            data = self._parse_json_object(content)
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+        score_by_id: dict[str, float] = {}
+        raw_scores = data.get("scores")
+        if isinstance(raw_scores, dict):
+            for candidate_id, value in raw_scores.items():
+                candidate_id = str(candidate_id).strip()
+                if candidate_id not in id_to_passage:
+                    continue
+                numeric = MemoryLayer._safe_float(value)
+                if numeric > 1.0:
+                    numeric = numeric / 100.0
+                score_by_id[candidate_id] = max(0.0, min(1.0, numeric))
+
+        ranked_ids = data.get("ranked_ids")
+        if isinstance(ranked_ids, list):
+            valid_ids = [str(item).strip() for item in ranked_ids if str(item).strip() in id_to_passage]
+            total = max(len(valid_ids), 1)
+            for rank_index, candidate_id in enumerate(valid_ids):
+                rank_score = 1.0 - (rank_index / total)
+                score_by_id[candidate_id] = max(score_by_id.get(candidate_id, 0.0), rank_score)
+
+        return {
+            id_to_passage[candidate_id]: score
+            for candidate_id, score in score_by_id.items()
+            if candidate_id in id_to_passage
+        }
+
+    def _get_cross_encoder_model(self) -> Any | None:
+        if self.cross_encoder_model is not None:
+            return self.cross_encoder_model
+        if self.cross_encoder_unavailable:
+            return None
+        try:
+            from sentence_transformers import CrossEncoder
+
+            device = os.getenv("LINEARRAG_CROSS_ENCODER_DEVICE") or os.getenv("LINEARRAG_DEVICE") or self._default_device()
+            self.cross_encoder_model = CrossEncoder(self.cross_encoder_model_path, device=device)
+            return self.cross_encoder_model
+        except Exception:
+            self.cross_encoder_unavailable = True
+            return None
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        if value >= 0:
+            z = pow(2.718281828459045, -value)
+            return 1.0 / (1.0 + z)
+        z = pow(2.718281828459045, value)
+        return z / (1.0 + z)
 
     def _match_sidecar_memories(
         self,
@@ -1098,11 +1690,15 @@ class LinearRAGMemoryService:
                 metadata.get("session_time")
                 or metadata.get("memory_timestamp")
                 or metadata.get("memory_time_iso")
+                or metadata.get("resolved_time")
+                or metadata.get("resolved_times")
             )
             if has_text_time:
                 signal += 0.80
             if has_relative:
                 signal += 0.20
+            if metadata.get("resolved_time") or metadata.get("resolved_times"):
+                signal += 0.30
             if has_structured_time:
                 signal += 0.10 if (has_text_time or has_relative) else 0.05
             return min(1.0, signal)
@@ -1651,6 +2247,86 @@ class LinearRAGMemoryService:
         return max(0.78, min(1.42, factor))
 
     @classmethod
+    def _temporal_match_score(
+        cls,
+        query: str,
+        temporal_intent: dict[str, Any],
+        temporal_profile: dict[str, Any],
+        passage: str,
+    ) -> float:
+        intent = str(temporal_intent.get("temporal_intent") or "neutral")
+        if intent == "neutral" and not cls._is_temporal_query(query):
+            return 0.0
+
+        content = cls._strip_internal_prefix(passage).lower()
+        query_values = cls._time_values(query)
+        resolved_times = cls._profile_resolved_times(temporal_profile)
+        normalized_times = [
+            str(value).strip().lower()
+            for value in temporal_profile.get("normalized_time_expressions") or []
+            if str(value).strip()
+        ]
+        raw_times = [
+            str(value).strip().lower()
+            for value in temporal_profile.get("time_expressions") or []
+            if str(value).strip()
+        ]
+
+        score = 0.0
+        if resolved_times:
+            score += 0.28
+        if temporal_profile.get("has_relative_time") and resolved_times:
+            score += 0.16
+        if temporal_profile.get("has_explicit_time"):
+            score += 0.10
+
+        for value in query_values:
+            normalized = value.lower()
+            if normalized in content or normalized in raw_times or normalized in normalized_times:
+                score += 0.22
+            if normalized in resolved_times:
+                score += 0.32
+            if re.fullmatch(r"(?:19|20)\d{2}", normalized):
+                if any(item.startswith(normalized) for item in resolved_times):
+                    score += 0.24
+            if re.fullmatch(r"(?:19|20)\d{2}-\d{1,2}", normalized):
+                if any(item.startswith(normalized) for item in resolved_times):
+                    score += 0.24
+
+        if intent == "when_exact":
+            if resolved_times:
+                score += 0.20
+            if raw_times:
+                score += 0.10
+        elif intent == "duration":
+            if "duration_signal" in set(temporal_profile.get("temporal_cues") or []):
+                score += 0.24
+        elif intent in {"sequence_before", "sequence_after"}:
+            if resolved_times or temporal_profile.get("message_timestamp"):
+                score += 0.12
+        elif intent in {"recent", "current_state"}:
+            if "current_signal" in set(temporal_profile.get("temporal_cues") or []):
+                score += 0.14
+        elif intent == "history_state":
+            if "history_signal" in set(temporal_profile.get("temporal_cues") or []):
+                score += 0.14
+
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _profile_resolved_times(profile: dict[str, Any]) -> list[str]:
+        values: list[str] = []
+        for key in ("resolved_times", "resolved_time_values"):
+            for value in profile.get(key) or []:
+                text = str(value).strip().lower().replace("_to_", " to ")
+                if text and text not in values:
+                    values.append(text)
+                raw_text = str(value).strip().lower()
+                if raw_text and raw_text not in values:
+                    values.append(raw_text)
+        return values
+
+    @classmethod
     def _target_rerank_factor(
         cls,
         temporal_intent: dict[str, Any],
@@ -1923,12 +2599,14 @@ class LinearRAGMemoryService:
     def _time_values(cls, text: str) -> list[str]:
         patterns = [
             r"\b\d{4}-\d{1,2}-\d{1,2}\b",
+            r"\b\d{4}-\d{1,2}\b",
             r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
             r"\b(?:19|20)\d{2}\b",
             r"\b\d{1,2}:\d{2}(?:\s?[ap]\.?m\.?)?\b",
+            r"\b(?:last|next|this)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
             r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
             r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?\b",
-            r"\b(?:today|yesterday|tomorrow|tonight|last week|next week|last month|next month|last year|next year|recently|currently|now|before|previously|earlier|later)\b",
+            r"\b(?:today|yesterday|tomorrow|tonight|this week|last week|next week|this month|last month|next month|this year|last year|next year|recently|currently|now|before|previously|earlier|later)\b",
         ]
         values = []
         for pattern in patterns:
@@ -1942,7 +2620,7 @@ class LinearRAGMemoryService:
     def _has_relative_time_expression(text: str) -> bool:
         return bool(
             re.search(
-                r"\b(?:today|yesterday|tomorrow|tonight|last week|next week|last month|next month|last year|next year|recently|currently|now|before|previously|earlier|later|this month|this week)\b",
+                r"\b(?:today|yesterday|tomorrow|tonight|this week|last week|next week|this month|last month|next month|this year|last year|next year|recently|currently|now|before|previously|earlier|later)\b",
                 str(text or ""),
                 flags=re.IGNORECASE,
             )
@@ -1955,7 +2633,227 @@ class LinearRAGMemoryService:
     @staticmethod
     def _is_temporal_query(query: str) -> bool:
         lowered = query.lower()
-        return any(token in lowered for token in ("when", "date", "day", "month", "year", "time", "before", "after", "earlier", "later"))
+        return any(
+            token in lowered
+            for token in (
+                "when",
+                "date",
+                "day",
+                "month",
+                "year",
+                "time",
+                "before",
+                "after",
+                "earlier",
+                "later",
+                "recent",
+                "recently",
+                "current",
+                "currently",
+                "now",
+                "latest",
+                "previously",
+                "used to",
+                "since",
+                "until",
+                "yesterday",
+                "tomorrow",
+                "last ",
+                "next ",
+            )
+        )
+
+    def _load_raw_temporal_profiles(self, user_key: str) -> dict[str, dict[str, Any]]:
+        try:
+            return MemoryLayer(self._user_dir(user_key), max_chunk_chars=self.max_chunk_chars).load_raw_temporal_profiles()
+        except Exception:
+            return {}
+
+    def _format_search_content(
+        self,
+        query: str,
+        passage: str,
+        temporal_profile: dict[str, Any] | None = None,
+    ) -> str:
+        content = self._clean_search_content(passage)
+        if not self._is_temporal_query(query):
+            return content
+
+        note = self._temporal_evidence_note(temporal_profile or {})
+        if not note:
+            metadata = self._passage_metadata(passage)
+            fallback_profile = {
+                "time_expressions": metadata.get("time_expressions", "").split("|"),
+                "resolved_times": metadata.get("resolved_times", "").split("|"),
+                "message_timestamp": metadata.get("memory_timestamp", ""),
+            }
+            note = self._temporal_evidence_note(fallback_profile)
+        if not note:
+            return content
+
+        return f"{note}\nEvidence: {content}".strip()
+
+    @classmethod
+    def _temporal_evidence_note(cls, temporal_profile: dict[str, Any]) -> str:
+        if not isinstance(temporal_profile, dict):
+            return ""
+
+        resolutions = []
+        seen: set[tuple[str, str]] = set()
+        raw_resolution_items = [
+            item for item in (temporal_profile.get("time_resolutions") or [])
+            if isinstance(item, dict)
+        ]
+        has_complex_resolution = any(
+            cls._looks_relative_time_expression(str(item.get("expression") or ""))
+            or bool(re.search(r"\b(?:before|after|weekend|beginning|start|middle|mid|end)\b", str(item.get("expression") or ""), flags=re.IGNORECASE))
+            for item in raw_resolution_items
+        )
+
+        def resolution_priority(item: dict[str, Any]) -> tuple[int, int]:
+            expression = str(item.get("expression") or "")
+            resolved = str(item.get("resolved") or "")
+            is_complex = (
+                cls._looks_relative_time_expression(expression)
+                or bool(re.search(r"\b(?:before|after|weekend|beginning|start|middle|mid|end)\b", expression, flags=re.IGNORECASE))
+            )
+            is_plain_year = bool(re.fullmatch(r"(?:19|20)\d{2}", expression.strip()))
+            is_same = expression.strip().lower() == resolved.strip().lower()
+            return (0 if is_complex else 2 if is_plain_year or is_same else 1, -len(expression))
+
+        for item in sorted(raw_resolution_items, key=resolution_priority):
+            if not isinstance(item, dict):
+                continue
+            expression = re.sub(r"\s+", " ", str(item.get("expression") or "").strip())
+            resolved = cls._display_time_value(str(item.get("resolved") or "").strip())
+            if not expression or not resolved:
+                continue
+            if has_complex_resolution and re.fullmatch(r"(?:19|20)\d{2}", expression):
+                continue
+            key = (expression.lower(), resolved.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            anchor = cls._display_time_value(str(item.get("anchor_time") or "").strip())
+            if cls._looks_relative_time_expression(expression) and anchor:
+                resolutions.append(
+                    f'"{expression}" means {resolved} using message timestamp {anchor} as its anchor'
+                )
+            else:
+                resolutions.append(f'"{expression}" means {resolved}')
+            if len(resolutions) >= 3:
+                break
+
+        if resolutions:
+            return "Temporal evidence: " + "; ".join(resolutions) + "."
+
+        resolved_times = [
+            cls._display_time_value(str(value).strip())
+            for value in (
+                temporal_profile.get("resolved_times")
+                or temporal_profile.get("resolved_time_values")
+                or []
+            )
+            if str(value).strip()
+        ]
+        resolved_times = [value for index, value in enumerate(resolved_times) if value and value not in resolved_times[:index]]
+        if resolved_times:
+            return "Temporal evidence: resolved time " + ", ".join(resolved_times[:3]) + "."
+        return ""
+
+    @classmethod
+    def _temporal_resolution_summary(cls, temporal_profile: dict[str, Any]) -> str:
+        note = cls._temporal_evidence_note(temporal_profile)
+        return re.sub(r"^Temporal evidence:\s*", "", note).rstrip(".")
+
+    @staticmethod
+    def _display_time_value(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if "_to_" in raw:
+            start, end = raw.split("_to_", 1)
+            start_display = LinearRAGMemoryService._display_single_time_value(start, include_iso=False)
+            end_display = LinearRAGMemoryService._display_single_time_value(end, include_iso=False)
+            iso_range = f"{start} to {end}"
+            return f"{start_display} to {end_display} ({iso_range})"
+        return LinearRAGMemoryService._display_single_time_value(raw, include_iso=True)
+
+    @staticmethod
+    def _display_single_time_value(value: str, include_iso: bool = True) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        match = re.fullmatch(r"((?:19|20)\d{2})-(\d{2})-(\d{2})", raw)
+        if match:
+            year, month, day = [int(item) for item in match.groups()]
+            month_name = (
+                "January February March April May June July August September October November December".split()[month - 1]
+                if 1 <= month <= 12
+                else f"{month:02d}"
+            )
+            text = f"{day} {month_name} {year}"
+            return f"{text} ({raw})" if include_iso else text
+        match = re.fullmatch(r"((?:19|20)\d{2})-(\d{2})", raw)
+        if match:
+            year, month = [int(item) for item in match.groups()]
+            month_name = (
+                "January February March April May June July August September October November December".split()[month - 1]
+                if 1 <= month <= 12
+                else f"{month:02d}"
+            )
+            text = f"{month_name} {year}"
+            return f"{text} ({raw})" if include_iso else text
+        return re.sub(r"_to_", " to ", raw)
+
+    @staticmethod
+    def _looks_relative_time_expression(value: str) -> bool:
+        lowered = str(value or "").lower()
+        return bool(
+            re.search(
+                r"\b(?:today|tonight|yesterday|tomorrow|last|next|this|recently|currently|now|ago|in\s+\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                lowered,
+            )
+        )
+
+    @staticmethod
+    def _strip_temporal_metadata_tags(content: str) -> str:
+        text = re.sub(
+            r"\s*\[(?:resolved_time|resolved_times|time_expressions)=[^\]]+\]",
+            "",
+            str(content or ""),
+        )
+        return re.sub(r"[ \t]+\n", "\n", text).strip()
+
+    @classmethod
+    def _clean_search_content(cls, passage: str) -> str:
+        text = cls._strip_internal_prefix(str(passage or ""))
+        text = cls._strip_temporal_metadata_tags(text)
+        cleaned_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", stripped).strip()
+            stripped = re.sub(
+                r"^([A-Z][A-Za-z0-9 ._'-]{0,60}:\s*)(?:\[[^\]]+\]\s*)+",
+                r"\1",
+                stripped,
+            ).strip()
+            stripped = re.sub(
+                r"\s*\[(?:raw_id|memory_timestamp|memory_time_iso|order_index|session_id|request_id|dia_id|source_session_index|source_message_index|session_index|message_index|session_time|memory_evidence_id|memory_status)=[^\]]+\]",
+                "",
+                stripped,
+            ).strip()
+            stripped = re.sub(r"^([A-Z][A-Za-z0-9 ._'-]{0,60}:\s*)\1+", r"\1", stripped)
+            stripped = re.sub(r"\s+", " ", stripped).strip()
+            if re.fullmatch(r"[A-Z][A-Za-z0-9 ._'-]{0,60}:", stripped):
+                continue
+            if stripped and stripped not in cleaned_lines:
+                cleaned_lines.append(stripped)
+        if not cleaned_lines:
+            return text.strip()
+        return "\n".join(cleaned_lines).strip()
 
     @classmethod
     def _passage_metadata(cls, passage: str) -> dict[str, Any]:
@@ -1970,6 +2868,9 @@ class LinearRAGMemoryService:
             "session_time": cls._bracket_value(visible, "session_time"),
             "memory_timestamp": cls._bracket_value(visible, "memory_timestamp"),
             "memory_time_iso": cls._bracket_value(visible, "memory_time_iso"),
+            "resolved_time": cls._bracket_value(visible, "resolved_time"),
+            "resolved_times": cls._bracket_value(visible, "resolved_times"),
+            "time_expressions": cls._bracket_value(visible, "time_expressions"),
             "order_index": cls._bracket_value(visible, "order_index"),
             "session_id": cls._bracket_value(visible, "session_id"),
             "request_id": cls._bracket_value(visible, "request_id"),

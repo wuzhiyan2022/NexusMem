@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import calendar
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,12 +30,6 @@ class MemoryLayer:
         "today",
         "these days",
         "at the moment",
-        "现在",
-        "目前",
-        "当前",
-        "最近",
-        "最新",
-        "如今",
     }
     HISTORY_HINTS = {
         "before",
@@ -47,12 +42,6 @@ class MemoryLayer:
         "past",
         "once",
         "formerly",
-        "以前",
-        "之前",
-        "曾经",
-        "原来",
-        "过去",
-        "历史",
     }
     UPDATE_HINTS = {
         "now",
@@ -70,19 +59,6 @@ class MemoryLayer:
         "became",
         "turns out",
         "again",
-        "现在",
-        "目前",
-        "最近",
-        "不再",
-        "再也不",
-        "曾经",
-        "以前",
-        "改为",
-        "换成",
-        "搬到",
-        "变成",
-        "重新",
-        "又",
     }
     UNCERTAINTY_HINTS = {
         "maybe",
@@ -92,10 +68,6 @@ class MemoryLayer:
         "not sure",
         "i think",
         "perhaps",
-        "可能",
-        "也许",
-        "大概",
-        "不确定",
     }
     CONFIDENCE_BASE_BY_SOURCE = {
         "exact_rule": 0.82,
@@ -305,6 +277,26 @@ class MemoryLayer:
                         str(record.get("timestamp") or ""),
                         int(record.get("order_index") or index),
                     )
+                elif (
+                    "resolved_times" not in profile
+                    or "normalized_time_expressions" not in profile
+                    or "time_resolutions" not in profile
+                ):
+                    refreshed_profile = self.temporal_profile(
+                        str(record.get("content") or ""),
+                        str(record.get("timestamp") or ""),
+                        int(record.get("order_index") or index),
+                    )
+                    profile = dict(profile)
+                    for key in (
+                        "resolved_times",
+                        "resolved_time_values",
+                        "normalized_time_expressions",
+                        "time_resolutions",
+                        "has_resolved_time",
+                    ):
+                        if key not in profile:
+                            profile[key] = refreshed_profile.get(key)
                 profile = dict(profile)
                 content_metadata = self._content_metadata(str(record.get("content") or ""))
                 profile.setdefault("raw_id", raw_id)
@@ -395,6 +387,27 @@ class MemoryLayer:
         timestamp_iso = MemoryLayer._timestamp_iso(timestamp)
         if timestamp_iso:
             parts.append(f"[memory_time_iso={timestamp_iso}]")
+        temporal_profile = raw.get("temporal_profile") or {}
+        if isinstance(temporal_profile, dict):
+            resolved_times = [
+                str(value).strip()
+                for value in temporal_profile.get("resolved_times") or []
+                if str(value).strip()
+            ]
+            if resolved_times:
+                parts.append(f"[resolved_time={MemoryLayer._metadata_token(resolved_times[0])}]")
+                parts.append(
+                    f"[resolved_times={MemoryLayer._metadata_token('|'.join(resolved_times[:6]))}]"
+                )
+            time_expressions = [
+                str(value).strip()
+                for value in temporal_profile.get("time_expressions") or []
+                if str(value).strip()
+            ]
+            if time_expressions:
+                parts.append(
+                    f"[time_expressions={MemoryLayer._metadata_token('|'.join(time_expressions[:6]))}]"
+                )
         if raw.get("dia_id"):
             parts.append(f"[dia_id={raw.get('dia_id', '')}]")
         if raw.get("source_session_index"):
@@ -402,6 +415,13 @@ class MemoryLayer:
         if raw.get("source_message_index"):
             parts.append(f"[source_message_index={raw.get('source_message_index', '')}]")
         return " ".join(parts)
+
+    @staticmethod
+    def _metadata_token(value: Any) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"[\]\[]+", "", text)
+        text = re.sub(r"\s+", "_", text)
+        return text[:240]
 
     @staticmethod
     def _timestamp_iso(value: Any) -> str:
@@ -979,25 +999,6 @@ class MemoryLayer:
                         pattern="preference",
                     )
                 )
-
-        zh_patterns = [
-            (r"我(?:现在|目前|最近)?(?:不再|再也不|不)(?:喜欢|爱|偏好)(.+)$", "negative"),
-            (r"我(?:现在|目前|最近)?(?:喜欢|爱|偏好)(.+)$", "positive"),
-            (r"我最喜欢(?:的)?[\w\u4e00-\u9fff\s]{0,20}是(.+)$", "positive"),
-        ]
-        for pattern, polarity in zh_patterns:
-            match = re.search(pattern, sentence)
-            if match:
-                candidates.append(
-                    self._candidate(
-                        memory_type="preference",
-                        subject="user",
-                        predicate="preference",
-                        object_text=self._clean_object(match.group(1)),
-                        polarity=polarity,
-                        pattern="preference_zh",
-                    )
-                )
         return [candidate for candidate in candidates if candidate["object"]]
 
     def _fact_candidates(self, sentence: str) -> list[dict[str, Any]]:
@@ -1020,25 +1021,6 @@ class MemoryLayer:
                         object_text=self._clean_object(match.group(1)),
                         polarity="neutral",
                         pattern=predicate,
-                    )
-                )
-
-        zh_patterns = [
-            (r"我(?:现在|目前)?(?:住在|居住在|搬到)(.+)$", "current_location"),
-            (r"我(?:现在|目前)?在(.+?)(?:工作|上班)$", "workplace"),
-            (r"我(?:现在|目前)?在(.+?)(?:学习|读书|上学)$", "education"),
-        ]
-        for pattern, predicate in zh_patterns:
-            match = re.search(pattern, sentence)
-            if match:
-                candidates.append(
-                    self._candidate(
-                        memory_type="fact",
-                        subject="user",
-                        predicate=predicate,
-                        object_text=self._clean_object(match.group(1)),
-                        polarity="neutral",
-                        pattern=f"{predicate}_zh",
                     )
                 )
         return [candidate for candidate in candidates if candidate["object"]]
@@ -1067,26 +1049,12 @@ class MemoryLayer:
                         pattern="relation",
                     )
                 )
-
-        zh_match = re.search(r"([\w\u4e00-\u9fff .'-]{1,40})是我的(朋友|同事|妻子|丈夫|伴侣|姐妹|兄弟|妈妈|爸爸|经理|老板|队友|同学|室友|老师)", sentence)
-        if zh_match:
-            candidates.append(
-                self._candidate(
-                    memory_type="relation",
-                    subject="user",
-                    predicate=f"relation:{zh_match.group(2)}",
-                    object_text=self._clean_object(zh_match.group(1)),
-                    polarity="neutral",
-                    pattern="relation_zh",
-                )
-            )
         return [candidate for candidate in candidates if candidate["object"]]
 
     def _rule_candidates(self, sentence: str) -> list[dict[str, Any]]:
         lowered = sentence.lower()
         if not any(token in lowered for token in ("always", "never", "must", "should", "need to", "if ", "when ")):
-            if not any(token in sentence for token in ("总是", "从不", "必须", "应该", "如果", "当")):
-                return []
+            return []
         return [
             self._candidate(
                 memory_type="rule",
@@ -1107,8 +1075,8 @@ class MemoryLayer:
             "graduated|married|divorced|adopted|lost|found|watched|read|saw|ate|had|made|created|launched"
         )
         patterns = [
-            rf"\b(?P<subject>i|we)\s+(?P<trigger>{event_verbs})\b(?P<object>[^.!?。！？]*)",
-            rf"\b(?P<subject>[A-Z][A-Za-z .'-]{{1,80}})\s+(?P<trigger>{event_verbs})\b(?P<object>[^.!?。！？]*)",
+            rf"\b(?P<subject>i|we)\s+(?P<trigger>{event_verbs})\b(?P<object>[^.!?]*)",
+            rf"\b(?P<subject>[A-Z][A-Za-z .'-]{{1,80}})\s+(?P<trigger>{event_verbs})\b(?P<object>[^.!?]*)",
         ]
         for pattern in patterns:
             match = re.search(pattern, sentence, flags=re.IGNORECASE)
@@ -1839,13 +1807,13 @@ class MemoryLayer:
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:
-        pieces = re.split(r"(?<=[.!?。！？])\s+|\n+", text)
+        pieces = re.split(r"(?<=[.!?])\s+|\n+", text)
         return [piece.strip() for piece in pieces if piece.strip()]
 
     @staticmethod
     def _event_subject(value: str) -> str:
         normalized = str(value or "").strip()
-        return "user" if normalized.lower() in {"i", "we"} or normalized in {"我", "我们"} else normalized
+        return "user" if normalized.lower() in {"i", "we"} else normalized
 
     @staticmethod
     def _canonical_event_trigger(trigger: str) -> str:
@@ -1885,7 +1853,19 @@ class MemoryLayer:
 
     @classmethod
     def temporal_profile(cls, text: str, timestamp: str, order_index: int) -> dict[str, Any]:
-        time_expressions = cls._extract_time_expressions(text, timestamp)
+        anchor_date = cls._anchor_date(timestamp, text)
+        semantic_text = cls._semantic_time_text(text)
+        time_expressions = cls._extract_time_expressions(semantic_text, timestamp)
+        time_resolutions = cls._time_resolutions(time_expressions, anchor_date)
+        resolved_times = []
+        for item in time_resolutions:
+            resolved = str(item.get("resolved") or "").strip()
+            if resolved and resolved not in resolved_times:
+                resolved_times.append(resolved)
+        normalized_time_expressions = [
+            cls._normalize_time_expression(expression, timestamp)
+            for expression in time_expressions
+        ]
         time_kinds = []
         for expression in time_expressions:
             kind = cls._time_kind(expression)
@@ -1896,8 +1876,13 @@ class MemoryLayer:
             "message_timestamp": timestamp,
             "order_index": int(order_index),
             "time_expressions": time_expressions,
+            "normalized_time_expressions": normalized_time_expressions,
+            "time_resolutions": time_resolutions,
+            "resolved_times": resolved_times,
+            "resolved_time_values": resolved_times,
             "time_kinds": time_kinds,
             "has_explicit_time": bool(time_expressions),
+            "has_resolved_time": bool(resolved_times),
             "has_relative_time": any(kind == "relative" for kind in time_kinds),
             "temporal_cues": temporal_cues,
             "current_score": 1.0 if "current_signal" in temporal_cues else 0.0,
@@ -1928,16 +1913,21 @@ class MemoryLayer:
             r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
             r"\b(?:19|20)\d{2}\b",
             r"\b\d{1,2}:\d{2}(?:\s?[ap]\.?m\.?)?\b",
+            r"\b(?:the\s+)?week\s+before\s+\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*,?\s+(?:19|20)\d{2}\b",
+            r"\b(?:the\s+)?weekend\s+before\s+\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*,?\s+(?:19|20)\d{2}\b",
+            r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+weekends?\s+before\s+\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*,?\s+(?:19|20)\d{2}\b",
+            r"\b(?:beginning|start|middle|mid|end)\s+of\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(?:19|20)\d{2}\b",
+            r"\b(?:last|next|this)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            r"\b(?:last|next|this)\s+weekend\b",
+            r"\b(?:last|next|this)\s+(?:spring|summer|fall|autumn|winter)\b",
+            r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:days?|weeks?|weekends?|months?|years?)\s+ago\b",
+            r"\bin\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:days?|weeks?|weekends?|months?|years?)\b",
             r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
             r"\b(?:spring|summer|fall|autumn|winter)\s+(?:19|20)\d{2}\b",
             r"\bq[1-4]\s+(?:19|20)\d{2}\b",
-            r"\b(?:today|yesterday|tomorrow|tonight|last week|next week|last month|next month|last year|next year|recently|currently|now|before|previously|earlier this year|later this year)\b",
+            r"\b(?:today|yesterday|tomorrow|tonight|this week|last week|next week|this month|last month|next month|this year|last year|next year|recently|currently|now|before|previously|earlier this year|later this year)\b",
             r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?\b",
-            r"\d{4}年\d{1,2}月\d{1,2}日",
-            r"\d{4}年\d{1,2}月",
-            r"\d{1,2}月\d{1,2}日",
-            r"\d{1,2}点\d{0,2}分?",
-            r"(?:今天|昨天|明天|今晚|上周|下周|上个月|下个月|去年|明年|最近|目前|现在|以前|曾经|今年早些时候|今年晚些时候)",
+            r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:,?\s+\d{4})?\b",
         ]
         for pattern in patterns:
             for match in re.findall(pattern, text, flags=re.IGNORECASE):
@@ -1945,6 +1935,19 @@ class MemoryLayer:
                 if value and value not in values:
                     values.append(value)
         return values
+
+    @staticmethod
+    def _semantic_time_text(text: str) -> str:
+        lines: list[str] = []
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", stripped).strip()
+            if not stripped or re.fullmatch(r"(?:\[[^\]]+\]\s*)+", stripped):
+                continue
+            lines.append(stripped)
+        return "\n".join(lines) if lines else str(text or "")
 
     def _build_event_time_graph(
         self,
@@ -2019,7 +2022,7 @@ class MemoryLayer:
         lowered = expression.lower()
         if re.fullmatch(r"(?:19|20)\d{2}", lowered):
             return "year"
-        if re.search(r"\d{1,2}:\d{2}|\d{1,2}点", lowered):
+        if re.search(r"\d{1,2}:\d{2}", lowered):
             return "clock_time"
         if any(
             token in lowered
@@ -2029,14 +2032,403 @@ class MemoryLayer:
             )
         ):
             return "relative"
-        if any(token in expression for token in ("今天", "昨天", "明天", "去年", "明年", "最近", "目前", "现在", "以前", "曾经")):
-            return "relative"
         return "date"
 
     @staticmethod
     def _normalize_time_expression(expression: str, message_timestamp: str) -> str:
         value = str(expression or "").strip()
+        resolved = MemoryLayer._resolve_single_time_expression(
+            value,
+            MemoryLayer._anchor_date(message_timestamp, ""),
+        )
+        if resolved:
+            return resolved
         return re.sub(r"\s+", " ", value.lower())
+
+    @classmethod
+    def _resolve_time_expressions(cls, expressions: list[str], anchor_date: datetime | None) -> list[str]:
+        resolved: list[str] = []
+        for expression in expressions:
+            value = cls._resolve_single_time_expression(expression, anchor_date)
+            if value and value not in resolved:
+                resolved.append(value)
+        return resolved
+
+    @classmethod
+    def _time_resolutions(cls, expressions: list[str], anchor_date: datetime | None) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        anchor_label = cls._date_label(anchor_date) if anchor_date else ""
+        for expression in expressions:
+            clean_expression = re.sub(r"\s+", " ", str(expression or "").strip())
+            if not clean_expression:
+                continue
+            resolved = cls._resolve_single_time_expression(clean_expression, anchor_date)
+            if not resolved:
+                continue
+            row = {
+                "expression": clean_expression,
+                "resolved": resolved,
+            }
+            if anchor_label:
+                row["anchor_time"] = anchor_label
+            if row not in rows:
+                rows.append(row)
+        return rows
+
+    @classmethod
+    def _resolve_single_time_expression(cls, expression: str, anchor_date: datetime | None) -> str:
+        value = re.sub(r"\s+", " ", str(expression or "").strip())
+        if not value:
+            return ""
+        lowered = value.lower()
+
+        week_before_match = re.fullmatch(
+            r"(?:the\s+)?week\s+before\s+(.+)",
+            lowered,
+        )
+        if week_before_match:
+            target_date = cls._parse_datetime(week_before_match.group(1))
+            if target_date:
+                start_of_target_week = target_date - timedelta(days=target_date.weekday())
+                start = start_of_target_week - timedelta(days=7)
+                end = start + timedelta(days=6)
+                return f"{cls._date_label(start)}_to_{cls._date_label(end)}"
+
+        weekend_before_match = re.fullmatch(
+            r"(?:the\s+)?(?:(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?weekends?\s+before\s+(.+)",
+            lowered,
+        )
+        if weekend_before_match:
+            amount_text, target_text = weekend_before_match.groups()
+            amount = cls._small_number(amount_text or "one")
+            target_date = cls._parse_datetime(target_text)
+            if target_date:
+                days_since_sunday = (target_date.weekday() - 6) % 7
+                if days_since_sunday == 0:
+                    days_since_sunday = 7
+                end = target_date - timedelta(days=days_since_sunday + 7 * (amount - 1))
+                start = end - timedelta(days=1)
+                return f"{cls._date_label(start)}_to_{cls._date_label(end)}"
+
+        month_part_match = re.fullmatch(
+            r"(beginning|start|middle|mid|end)\s+of\s+"
+            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+((?:19|20)\d{2})",
+            lowered,
+        )
+        if month_part_match:
+            part, month_name, year_text = month_part_match.groups()
+            year = int(year_text)
+            month = cls._month_index(month_name)
+            last_day = calendar.monthrange(year, month)[1]
+            if part in {"beginning", "start"}:
+                start_day, end_day = 1, min(10, last_day)
+            elif part in {"middle", "mid"}:
+                start_day, end_day = 11, min(20, last_day)
+            else:
+                start_day, end_day = 21, last_day
+            return f"{year:04d}-{month:02d}-{start_day:02d}_to_{year:04d}-{month:02d}-{end_day:02d}"
+
+        absolute = cls._normalize_absolute_time(value, anchor_date)
+        if absolute:
+            return absolute
+        if not anchor_date:
+            return ""
+
+        if lowered in {"today", "tonight", "currently", "now", "recently"}:
+            return cls._date_label(anchor_date)
+        if lowered == "yesterday":
+            return cls._date_label(anchor_date - timedelta(days=1))
+        if lowered == "tomorrow":
+            return cls._date_label(anchor_date + timedelta(days=1))
+        if lowered in {"this week", "last week", "next week"}:
+            offset = {"last week": -1, "this week": 0, "next week": 1}[lowered]
+            start = anchor_date - timedelta(days=anchor_date.weekday()) + timedelta(days=7 * offset)
+            end = start + timedelta(days=6)
+            return f"{cls._date_label(start)}_to_{cls._date_label(end)}"
+        if lowered in {"this month", "last month", "next month"}:
+            offset = {"last month": -1, "this month": 0, "next month": 1}[lowered]
+            year, month = cls._shift_month(anchor_date.year, anchor_date.month, offset)
+            return f"{year:04d}-{month:02d}"
+        if lowered in {"this year", "earlier this year", "later this year"}:
+            return f"{anchor_date.year:04d}"
+        if lowered == "last year":
+            return f"{anchor_date.year - 1:04d}"
+        if lowered == "next year":
+            return f"{anchor_date.year + 1:04d}"
+
+        week_before_match = re.fullmatch(
+            r"(?:the\s+)?week\s+before\s+(.+)",
+            lowered,
+        )
+        if week_before_match:
+            target_date = cls._parse_datetime(week_before_match.group(1))
+            if target_date:
+                start_of_target_week = target_date - timedelta(days=target_date.weekday())
+                start = start_of_target_week - timedelta(days=7)
+                end = start + timedelta(days=6)
+                return f"{cls._date_label(start)}_to_{cls._date_label(end)}"
+
+        weekend_before_match = re.fullmatch(
+            r"(?:the\s+)?(?:(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+)?weekends?\s+before\s+(.+)",
+            lowered,
+        )
+        if weekend_before_match:
+            amount_text, target_text = weekend_before_match.groups()
+            amount = cls._small_number(amount_text or "one")
+            target_date = cls._parse_datetime(target_text)
+            if target_date:
+                days_since_sunday = (target_date.weekday() - 6) % 7
+                if days_since_sunday == 0:
+                    days_since_sunday = 7
+                end = target_date - timedelta(days=days_since_sunday + 7 * (amount - 1))
+                start = end - timedelta(days=1)
+                return f"{cls._date_label(start)}_to_{cls._date_label(end)}"
+
+        named_weekend_match = re.fullmatch(r"(last|next|this)\s+weekend", lowered)
+        if named_weekend_match:
+            direction = named_weekend_match.group(1)
+            saturday = anchor_date + timedelta(days=(5 - anchor_date.weekday()))
+            if direction == "last" and saturday >= anchor_date:
+                saturday -= timedelta(days=7)
+            elif direction == "next" and saturday <= anchor_date:
+                saturday += timedelta(days=7)
+            end = saturday + timedelta(days=1)
+            return f"{cls._date_label(saturday)}_to_{cls._date_label(end)}"
+
+        month_part_match = re.fullmatch(
+            r"(beginning|start|middle|mid|end)\s+of\s+"
+            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+((?:19|20)\d{2})",
+            lowered,
+        )
+        if month_part_match:
+            part, month_name, year_text = month_part_match.groups()
+            year = int(year_text)
+            month = cls._month_index(month_name)
+            last_day = calendar.monthrange(year, month)[1]
+            if part in {"beginning", "start"}:
+                start_day, end_day = 1, min(10, last_day)
+            elif part in {"middle", "mid"}:
+                start_day, end_day = 11, min(20, last_day)
+            else:
+                start_day, end_day = 21, last_day
+            return f"{year:04d}-{month:02d}-{start_day:02d}_to_{year:04d}-{month:02d}-{end_day:02d}"
+
+        season_match = re.fullmatch(r"(last|next|this)\s+(spring|summer|fall|autumn|winter)", lowered)
+        if season_match:
+            direction, season = season_match.groups()
+            year = anchor_date.year + (1 if direction == "next" else -1 if direction == "last" else 0)
+            season_ranges = {
+                "spring": ("03-01", "05-31"),
+                "summer": ("06-01", "08-31"),
+                "fall": ("09-01", "11-30"),
+                "autumn": ("09-01", "11-30"),
+                "winter": ("12-01", "02-28"),
+            }
+            start_suffix, end_suffix = season_ranges[season]
+            end_year = year + 1 if season == "winter" else year
+            return f"{year:04d}-{start_suffix}_to_{end_year:04d}-{end_suffix}"
+
+        weekday_match = re.fullmatch(
+            r"(last|next|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+            lowered,
+        )
+        if weekday_match:
+            direction, weekday_name = weekday_match.groups()
+            target = cls._weekday_index(weekday_name)
+            delta = target - anchor_date.weekday()
+            if direction == "last" and delta >= 0:
+                delta -= 7
+            elif direction == "next" and delta <= 0:
+                delta += 7
+            return cls._date_label(anchor_date + timedelta(days=delta))
+
+        relative_match = re.fullmatch(
+            r"(?:in\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
+            r"(days?|weeks?|weekends?|months?|years?)\s*(ago)?",
+            lowered,
+        )
+        if relative_match:
+            amount_text, unit, ago = relative_match.groups()
+            amount = cls._small_number(amount_text)
+            direction = -1 if ago else 1
+            if "day" in unit:
+                return cls._date_label(anchor_date + timedelta(days=direction * amount))
+            if "week" in unit:
+                days = 14 * amount if "weekend" in unit else 7 * amount
+                return cls._date_label(anchor_date + timedelta(days=direction * days))
+            if "month" in unit:
+                year, month = cls._shift_month(anchor_date.year, anchor_date.month, direction * amount)
+                day = min(anchor_date.day, calendar.monthrange(year, month)[1])
+                return cls._date_label(anchor_date.replace(year=year, month=month, day=day))
+            if "year" in unit:
+                try:
+                    return cls._date_label(anchor_date.replace(year=anchor_date.year + direction * amount))
+                except ValueError:
+                    return cls._date_label(anchor_date.replace(year=anchor_date.year + direction * amount, day=28))
+        return ""
+
+    @staticmethod
+    def _anchor_date(timestamp: Any, text: str = "") -> datetime | None:
+        parsed = MemoryLayer._parse_datetime(str(timestamp or "").strip())
+        if parsed:
+            return parsed
+        session_match = re.search(r"\[session_time=([^\]]+)\]", str(text or ""))
+        if session_match:
+            return MemoryLayer._parse_datetime(session_match.group(1))
+        return None
+
+    @staticmethod
+    def _parse_datetime(value: str) -> datetime | None:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            return None
+        try:
+            timestamp = float(text)
+            if timestamp > 100000000000:
+                timestamp /= 1000.0
+            if timestamp > 0:
+                return datetime.fromtimestamp(timestamp, timezone.utc).replace(tzinfo=None)
+        except Exception:
+            pass
+        cleaned = re.sub(r"\b(?:on|at)\b", " ", text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        for fmt in (
+            "%I:%M %p %d %B, %Y",
+            "%I:%M %p %d %B %Y",
+            "%I:%M%p %d %B, %Y",
+            "%I:%M%p %d %B %Y",
+            "%d %B, %Y",
+            "%d %B %Y",
+            "%B %d, %Y",
+            "%B %d %Y",
+            "%d %b, %Y",
+            "%d %b %Y",
+            "%b %d, %Y",
+            "%b %d %Y",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%m/%d/%Y",
+            "%m/%d/%y",
+        ):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except Exception:
+                continue
+        date_match = re.search(
+            r"\b(\d{1,2})\s+"
+            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*,?\s+"
+            r"((?:19|20)\d{2})\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if date_match:
+            day, month_name, year = date_match.groups()
+            return datetime(int(year), MemoryLayer._month_index(month_name), int(day))
+        date_match = re.search(
+            r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+"
+            r"(\d{1,2}),?\s+((?:19|20)\d{2})\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if date_match:
+            month_name, day, year = date_match.groups()
+            return datetime(int(year), MemoryLayer._month_index(month_name), int(day))
+        return None
+
+    @staticmethod
+    def _normalize_absolute_time(value: str, anchor_date: datetime | None) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        lowered = text.lower()
+        iso_match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", lowered)
+        if iso_match:
+            year, month, day = [int(item) for item in iso_match.groups()]
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        slash_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", lowered)
+        if slash_match:
+            month, day, year = slash_match.groups()
+            year_i = int(year)
+            if year_i < 100:
+                year_i += 2000 if year_i < 70 else 1900
+            return f"{year_i:04d}-{int(month):02d}-{int(day):02d}"
+        if re.fullmatch(r"(?:19|20)\d{2}", lowered):
+            return lowered
+        parsed = MemoryLayer._parse_datetime(text)
+        if parsed:
+            return MemoryLayer._date_label(parsed)
+        month_day = re.fullmatch(
+            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})",
+            lowered,
+        )
+        if month_day and anchor_date:
+            month_name, day = month_day.groups()
+            return f"{anchor_date.year:04d}-{MemoryLayer._month_index(month_name):02d}-{int(day):02d}"
+        day_month = re.fullmatch(
+            r"(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*",
+            lowered,
+        )
+        if day_month and anchor_date:
+            day, month_name = day_month.groups()
+            return f"{anchor_date.year:04d}-{MemoryLayer._month_index(month_name):02d}-{int(day):02d}"
+        return ""
+
+    @staticmethod
+    def _date_label(value: datetime) -> str:
+        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+
+    @staticmethod
+    def _shift_month(year: int, month: int, offset: int) -> tuple[int, int]:
+        index = year * 12 + (month - 1) + offset
+        return index // 12, index % 12 + 1
+
+    @staticmethod
+    def _month_index(value: str) -> int:
+        lowered = value.strip().lower()
+        if lowered.startswith("sept"):
+            lowered = "sep"
+        months = {
+            "jan": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8,
+            "sep": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12,
+        }
+        return months.get(lowered[:3], 1)
+
+    @staticmethod
+    def _weekday_index(value: str) -> int:
+        weekdays = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        return weekdays.get(value.strip().lower(), 0)
+
+    @staticmethod
+    def _small_number(value: str) -> int:
+        numbers = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+        return numbers.get(value, int(value) if str(value).isdigit() else 1)
 
     @staticmethod
     def _time_node_id(expression: str, message_timestamp: str) -> str:
@@ -2059,34 +2451,30 @@ class MemoryLayer:
 
     @staticmethod
     def _clean_object(value: str) -> str:
-        text = value.strip(" \t\r\n\"'`.,!?。！？")
-        text = re.split(r"\b(?:but|because|although|while|and then)\b|[,;。；，]", text, maxsplit=1, flags=re.IGNORECASE)[0]
-        text = text.strip(" \t\r\n\"'`.,!?。！？")
+        text = str(value or "").strip(" \t\r\n\"'`.,!?")
+        text = re.split(r"\b(?:but|because|although|while|and then)\b|[,;]", text, maxsplit=1, flags=re.IGNORECASE)[0]
+        text = text.strip(" \t\r\n\"'`.,!?")
         text = re.sub(r"\b(?:now|currently|today|these days|anymore|instead|again)$", "", text, flags=re.IGNORECASE).strip()
-        text = text.strip(" \t\r\n\"'`.,!?。！？")
+        text = text.strip(" \t\r\n\"'`.,!?")
         text = re.sub(r"^(?:a|an|the)\s+", "", text, flags=re.IGNORECASE)
-        return text.strip(" \t\r\n\"'`.,!?。！？")
+        return text.strip(" \t\r\n\"'`.,!?")
 
     @staticmethod
     def _clean_event_object(value: str) -> str:
         text = MemoryLayer._clean_object(value)
         for expression in MemoryLayer._extract_time_expressions(text, ""):
-            if expression.startswith("message_timestamp:"):
-                continue
             text = re.sub(re.escape(expression), "", text, flags=re.IGNORECASE).strip()
         text = re.split(r"\b(?:after|before|during|since|until|following|prior\s+to)\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
         text = re.sub(r"^(?:to|in|at|for|from|with|on|into|onto|about)\s+", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s+(?:to|in|at|for|from|with|on|into|onto|about)$", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"^(?:到|去|在|从|和|与|把)", "", text)
-        text = re.sub(r"(?:今天|昨天|明天|今晚|上周|下周|上个月|下个月|去年|明年|最近|目前|现在|以前|曾经)$", "", text)
-        return text.strip(" \t\r\n\"'`.,!?。！？")
+        return text.strip(" \t\r\n\"'`.,!?")
 
     @staticmethod
     def _normalize_value(value: Any) -> str:
         text = str(value or "").strip().lower()
         text = re.sub(r"^(?:a|an|the)\s+", "", text)
         text = re.sub(r"\s+", " ", text)
-        return text.strip(" \t\r\n\"'`.,!?。！？")
+        return text.strip(" \t\r\n\"'`.,!?")
 
     @staticmethod
     def _candidate_id(candidate: dict[str, Any]) -> str:
@@ -2165,3 +2553,6 @@ class MemoryLayer:
     def _append_unique(values: list[Any], value: Any) -> None:
         if value and value not in values:
             values.append(value)
+
+
+

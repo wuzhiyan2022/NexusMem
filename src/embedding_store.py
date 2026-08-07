@@ -43,19 +43,23 @@ class EmbeddingStore:
         missing_ids = [h for h in all_hash_ids if h not in existing]      
         texts_to_encode = [nodes_dict[hash_id]["content"] for hash_id in missing_ids]
         if not texts_to_encode:
-            return
+            return []
         all_embeddings = self.embedding_model.encode(texts_to_encode,normalize_embeddings=True, show_progress_bar=False,batch_size=self.batch_size)
         
         self._upsert(missing_ids, texts_to_encode, all_embeddings)
+        return missing_ids
 
     def _upsert(self, hash_ids, texts, embeddings):
+        start_idx = len(self.hash_ids)
         self.hash_ids.extend(hash_ids)
         self.texts.extend(texts)
         self.embeddings.extend(embeddings)
         
-        self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
-        self.hash_id_to_text = {h: t for h, t in zip(self.hash_ids, self.texts)}
-        self.text_to_hash_id = {t: h for t, h in zip(self.texts, self.hash_ids)}
+        for offset, (hash_id, text) in enumerate(zip(hash_ids, texts)):
+            idx = start_idx + offset
+            self.hash_id_to_idx[hash_id] = idx
+            self.hash_id_to_text[hash_id] = text
+            self.text_to_hash_id[text] = hash_id
         
         self._save_data()
 

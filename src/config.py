@@ -7,7 +7,8 @@ class LinearRAGConfig:
     llm_model: LLM_Model = None
     chunk_token_size: int = 1000
     chunk_overlap_token_size: int = 100
-    spacy_model: str = "en_core_web_trf"
+    spacy_model: str = "en_core_web_sm"
+    spacy_fallback_model: str = "en_core_web_trf"
     working_dir: str = "./import"
     batch_size: int = 128
     max_workers: int = 16
@@ -28,6 +29,7 @@ class LinearRAGConfig:
     structured_memory_weight: float = 0.9
     structured_time_weight: float = 0.8
     structured_score_threshold: float = 0.2
+    graphml_write_interval: int = 5
     attribute_query_keywords: list[str] = field(default_factory=lambda: [
         "born", "birth", "where", "when", "located", "location", "founded", "founder",
         "died", "death", "nationality", "capital", "date", "year"
